@@ -1,0 +1,16 @@
+services:
+  ace:
+    build: .
+    image: ace:latest
+    container_name: ace
+    restart: unless-stopped
+    environment:
+      - ACE_MODEL=Qwen/Qwen2.5-0.5B-Instruct
+      - ACE_MAX_NEW_TOKENS=7000
+      - ACE_MEM_DIR=/app/mem
+      # Optional security:
+      # - ACE_API_KEY=change-me
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./mem:/app/mem

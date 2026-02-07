@@ -1,0 +1,101 @@
+:root {
+  --bg: #0f0f0f;
+  --panel: #151515;
+  --text: #e6e6e6;
+  --muted: #9aa0a6;
+  --accent: #00ff41;
+  --user: #00bfff;
+  --border: #2a2a2a;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  max-width: 980px;
+  margin: 0 auto;
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.topbar {
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.title { font-size: 18px; font-weight: 700; }
+.subtitle { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+.chat {
+  padding: 16px;
+  overflow: auto;
+}
+
+.msg {
+  margin: 12px 0;
+  padding: 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #101010;
+  white-space: pre-wrap;
+  line-height: 1.35;
+}
+
+.msg.user { border-color: rgba(0,191,255,0.35); }
+.msg.user .role { color: var(--user); }
+
+.msg.ace { border-color: rgba(0,255,65,0.35); }
+.msg.ace .role { color: var(--accent); }
+
+.role {
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.composer {
+  padding: 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+textarea {
+  width: 100%;
+  resize: none;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #0c0c0c;
+  color: var(--text);
+  padding: 12px;
+  outline: none;
+}
+
+.btn {
+  border: 1px solid var(--border);
+  background: #111;
+  color: var(--text);
+  border-radius: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.btn.primary {
+  border-color: rgba(0,255,65,0.5);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

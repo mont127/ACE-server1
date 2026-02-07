@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ACE v7.3</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div>
+        <div class="title">ACE v7.3</div>
+        <div class="subtitle" id="status">Connecting…</div>
+      </div>
+      <div class="right">
+        <button id="clear" class="btn">Clear</button>
+      </div>
+    </header>
+
+    <main class="chat" id="chat"></main>
+
+    <footer class="composer">
+      <textarea id="prompt" rows="3" placeholder="Type a message… (add ' ACW' at the end to enable ACW)"></textarea>
+      <button id="send" class="btn primary">Send</button>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
