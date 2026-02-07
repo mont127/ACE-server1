@@ -1,446 +1,579 @@
 /*
-  ACE Web UI - app.js (fixed)
-  - Defensive DOM binding (won't crash if an element is missing)
-  - Login / Signup modal works
-  - Chat works only when logged in
-  - Uses cookies via fetch(..., { credentials: 'include' })
-  - Minimal XSS safety: render model output as textContent (never innerHTML)
+  ACE UI - resilient client
+  - Works even if element IDs/classes differ slightly
+  - Uses event delegation for all buttons/links
+  - Stores auth via cookie (credentials: 'include')
+  - Renders text safely (textContent) to avoid XSS
 */
 
-(() => {
-  'use strict';
+const API_BASE = ""; // same-origin
 
-  // -------------------------
-  // Helpers
-  // -------------------------
-  const $ = (sel) => document.querySelector(sel);
-  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+// ----------------------------
+// Helpers
+// ----------------------------
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-  function safeText(el, text) {
-    if (!el) return;
-    el.textContent = String(text ?? '');
+function byIdLoose(...ids) {
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) return el;
   }
+  return null;
+}
 
-  function show(el) {
-    if (!el) return;
-    el.classList.remove('hidden');
-    el.style.display = '';
+function firstExisting(selectors) {
+  for (const s of selectors) {
+    const el = $(s);
+    if (el) return el;
   }
+  return null;
+}
 
-  function hide(el) {
-    if (!el) return;
-    el.classList.add('hidden');
-    el.style.display = 'none';
+function setText(el, txt) {
+  if (!el) return;
+  el.textContent = txt;
+}
+
+function show(el) {
+  if (!el) return;
+  el.classList.remove("hidden");
+  el.style.display = "";
+  el.setAttribute("aria-hidden", "false");
+}
+
+function hide(el) {
+  if (!el) return;
+  el.classList.add("hidden");
+  el.style.display = "none";
+  el.setAttribute("aria-hidden", "true");
+}
+
+function isVisible(el) {
+  if (!el) return false;
+  return !(el.classList.contains("hidden") || getComputedStyle(el).display === "none");
+}
+
+function toast(msg) {
+  // Try to use existing toast/status area if present
+  const status = firstExisting([
+    "#status",
+    "#toast",
+    ".status",
+    ".toast",
+    "[data-role='status']",
+  ]);
+  if (status) {
+    setText(status, msg);
+    show(status);
+    setTimeout(() => {
+      // don't hide permanently if page uses it
+      if (status.id === "toast" || status.classList.contains("toast")) hide(status);
+    }, 3500);
+    return;
   }
+  alert(msg);
+}
 
-  function setDisabled(el, disabled) {
-    if (!el) return;
-    el.disabled = !!disabled;
-    if (disabled) el.setAttribute('aria-disabled', 'true');
-    else el.removeAttribute('aria-disabled');
-  }
+async function api(path, opts = {}) {
+  const res = await fetch(API_BASE + path, {
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      ...(opts.headers || {}),
+    },
+    credentials: "include",
+  });
 
-  function toast(msg, kind = 'info') {
-    // If your HTML has a toast element, use it; otherwise fallback to console + alert for errors.
-    const t = $('#toast') || $('#status') || $('#banner');
-    if (t) {
-      t.classList.remove('hidden');
-      t.dataset.kind = kind;
-      safeText(t, msg);
-      // auto-hide after a bit
-      clearTimeout(toast._tm);
-      toast._tm = setTimeout(() => {
-        // do not hide persistent banners if user wants to keep them; ok to hide here.
-        t.classList.add('hidden');
-      }, 3500);
-    } else {
-      if (kind === 'error') {
-        console.error(msg);
-        // avoid spamming alerts; only alert for error.
-        alert(msg);
-      } else {
-        console.log(msg);
-      }
-    }
-  }
-
-  async function api(path, { method = 'GET', body = null, headers = {} } = {}) {
-    const opts = {
-      method,
-      credentials: 'include',
-      headers: {
-        ...headers,
-      },
-    };
-
-    if (body !== null) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-
-    const res = await fetch(path, opts);
-    const ct = res.headers.get('content-type') || '';
-    const isJson = ct.includes('application/json');
-    const data = isJson ? await res.json().catch(() => ({})) : await res.text().catch(() => '');
-
-    if (!res.ok) {
-      const detail = (data && data.detail) ? data.detail : (typeof data === 'string' ? data : 'Request failed');
-      const err = new Error(detail);
-      err.status = res.status;
-      err.data = data;
-      throw err;
-    }
-
-    return data;
-  }
-
-  // -------------------------
-  // State
-  // -------------------------
-  const state = {
-    user: null,
-    sessionId: null,
-    busy: false,
-  };
-
-  // -------------------------
-  // DOM refs (optional)
-  // -------------------------
-  // Modal
-  const modal = $('#authModal') || $('#modal') || $('.modal');
-  const modalBackdrop = $('#authBackdrop') || $('#modalBackdrop') || $('.modal-backdrop');
-  const modalCloseBtn = $('#authClose') || $('#modalClose') || $('#closeModal') || $('.modal-close');
-
-  // Tabs / forms
-  const tabLoginBtn = $('#tabLogin') || $('[data-tab="login"]');
-  const tabSignupBtn = $('#tabSignup') || $('[data-tab="signup"]');
-
-  const loginForm = $('#loginForm') || $('#formLogin') || $('[data-form="login"]');
-  const signupForm = $('#signupForm') || $('#formSignup') || $('[data-form="signup"]');
-
-  // Buttons
-  const openAuthBtn = $('#openAuth') || $('#loginBtn') || $('#btnLogin') || $('[data-action="open-auth"]');
-  const logoutBtn = $('#logoutBtn') || $('#btnLogout') || $('[data-action="logout"]');
-
-  // Status area
-  const whoamiEl = $('#whoami') || $('#userLabel') || $('#userEmail');
-  const authHintEl = $('#authHint') || $('#authStatus');
-
-  // Chat
-  const chatForm = $('#chatForm') || $('#formChat') || $('[data-form="chat"]');
-  const chatInput = $('#chatInput') || $('#prompt') || $('#input') || $('textarea');
-  const sendBtn = $('#sendBtn') || $('#btnSend') || $('[data-action="send"]');
-  const chatLog = $('#chatLog') || $('#messages') || $('#chat') || $('#output');
-
-  // -------------------------
-  // Modal control
-  // -------------------------
-  function openModal() {
-    if (!modal) {
-      toast('Auth UI not found in index.html (missing #authModal).', 'error');
-      return;
-    }
-    show(modal);
-    if (modalBackdrop) show(modalBackdrop);
-    // default to login tab
-    selectTab('login');
-  }
-
-  function closeModal() {
-    if (!modal) return;
-    hide(modal);
-    if (modalBackdrop) hide(modalBackdrop);
-  }
-
-  function selectTab(which) {
-    const w = (which || 'login').toLowerCase();
-
-    if (loginForm) {
-      if (w === 'login') show(loginForm); else hide(loginForm);
-    }
-    if (signupForm) {
-      if (w === 'signup') show(signupForm); else hide(signupForm);
-    }
-
-    // Optional tab button styles
-    if (tabLoginBtn) tabLoginBtn.classList.toggle('active', w === 'login');
-    if (tabSignupBtn) tabSignupBtn.classList.toggle('active', w === 'signup');
-  }
-
-  // -------------------------
-  // UI updates
-  // -------------------------
-  function setLoggedIn(user) {
-    state.user = user || null;
-    const loggedIn = !!state.user;
-
-    if (loggedIn) {
-      safeText(whoamiEl, state.user.email || state.user.username || 'Logged in');
-      safeText(authHintEl, '');
-      if (openAuthBtn) hide(openAuthBtn);
-      if (logoutBtn) show(logoutBtn);
-      if (chatInput) chatInput.placeholder = 'Ask ACE…';
-      setDisabled(chatInput, false);
-      setDisabled(sendBtn, false);
-      closeModal();
-    } else {
-      safeText(whoamiEl, 'Guest');
-      safeText(authHintEl, 'Log in to chat');
-      if (openAuthBtn) show(openAuthBtn);
-      if (logoutBtn) hide(logoutBtn);
-      if (chatInput) chatInput.placeholder = 'Log in to chat…';
-      setDisabled(chatInput, true);
-      setDisabled(sendBtn, true);
-    }
-  }
-
-  function appendMessage(role, text) {
-    if (!chatLog) return;
-
-    const line = document.createElement('div');
-    line.className = `msg ${role}`;
-
-    const header = document.createElement('div');
-    header.className = 'msg-head';
-    header.textContent = role === 'user' ? 'YOU' : 'ACE';
-
-    const body = document.createElement('pre');
-    body.className = 'msg-body';
-    // IMPORTANT: avoid XSS by using textContent
-    body.textContent = String(text ?? '');
-
-    line.appendChild(header);
-    line.appendChild(body);
-    chatLog.appendChild(line);
-
-    // scroll to bottom
-    chatLog.scrollTop = chatLog.scrollHeight;
-  }
-
-  function setBusy(b) {
-    state.busy = !!b;
-    setDisabled(sendBtn, b || !state.user);
-    if (chatInput) setDisabled(chatInput, b || !state.user);
-    if (sendBtn) sendBtn.textContent = b ? 'Thinking…' : 'Send';
-  }
-
-  // -------------------------
-  // Auth actions
-  // -------------------------
-  async function refreshMe() {
-    try {
-      const me = await api('/api/auth/me');
-      // Expected shapes: { logged_in: true, user: {..} } OR { user: {..} } OR { logged_in:false }
-      if (me && (me.logged_in === false || me.user === null)) {
-        setLoggedIn(null);
-        return;
-      }
-      if (me && me.user) {
-        setLoggedIn(me.user);
-        return;
-      }
-      // fallback: if endpoint returns user directly
-      if (me && (me.email || me.username)) {
-        setLoggedIn(me);
-        return;
-      }
-      setLoggedIn(null);
-    } catch (e) {
-      // If /api/auth/me not implemented or errors, treat as logged out
-      console.warn('refreshMe failed:', e);
-      setLoggedIn(null);
-    }
-  }
-
-  function getFormVal(form, name, fallbackSel) {
-    if (!form) return '';
-    const byName = form.querySelector(`[name="${name}"]`);
-    if (byName) return (byName.value || '').trim();
-    const bySel = fallbackSel ? form.querySelector(fallbackSel) : null;
-    if (bySel) return (bySel.value || '').trim();
-    return '';
-  }
-
-  async function doSignup(ev) {
-    ev?.preventDefault?.();
-    if (!signupForm) {
-      toast('Signup form not found in HTML.', 'error');
-      return;
-    }
-
-    const email = getFormVal(signupForm, 'email', '#signupEmail');
-    const password = getFormVal(signupForm, 'password', '#signupPassword');
-
-    if (!email || !password) {
-      toast('Enter email + password.', 'error');
-      return;
-    }
-
-    try {
-      setBusy(true);
-      await api('/api/auth/signup', { method: 'POST', body: { email, password } });
-      toast('Account created. Logging in…');
-      await api('/api/auth/login', { method: 'POST', body: { email, password } });
-      await refreshMe();
-    } catch (e) {
-      toast(`Signup failed: ${e.message}`, 'error');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function doLogin(ev) {
-    ev?.preventDefault?.();
-    if (!loginForm) {
-      toast('Login form not found in HTML.', 'error');
-      return;
-    }
-
-    const email = getFormVal(loginForm, 'email', '#loginEmail');
-    const password = getFormVal(loginForm, 'password', '#loginPassword');
-
-    if (!email || !password) {
-      toast('Enter email + password.', 'error');
-      return;
-    }
-
-    try {
-      setBusy(true);
-      await api('/api/auth/login', { method: 'POST', body: { email, password } });
-      await refreshMe();
-    } catch (e) {
-      toast(`Login failed: ${e.message}`, 'error');
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function doLogout(ev) {
-    ev?.preventDefault?.();
-    try {
-      setBusy(true);
-      await api('/api/auth/logout', { method: 'POST' });
-    } catch (e) {
-      // If not implemented, still clear UI
-      console.warn('logout failed:', e);
-    } finally {
-      setBusy(false);
-      setLoggedIn(null);
-      toast('Logged out');
-    }
-  }
-
-  // -------------------------
-  // Chat action
-  // -------------------------
-  async function sendChat(ev) {
-    ev?.preventDefault?.();
-
-    if (!state.user) {
-      openModal();
-      return;
-    }
-
-    const prompt = (chatInput?.value || '').trim();
-    if (!prompt) return;
-
-    // clear input early
-    if (chatInput) chatInput.value = '';
-    appendMessage('user', prompt);
-
-    try {
-      setBusy(true);
-      const out = await api('/api/chat', {
-        method: 'POST',
-        body: { prompt, session_id: state.sessionId || null },
-      });
-
-      if (out && out.session_id) state.sessionId = out.session_id;
-      appendMessage('ace', out?.response ?? '');
-    } catch (e) {
-      appendMessage('ace', `[ERROR] ${e.message}`);
-      toast(`Chat failed: ${e.message}`, 'error');
-
-      // If auth expired, force refresh
-      if (e.status === 401) {
-        await refreshMe();
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // -------------------------
-  // Bind events (after DOM is ready)
-  // -------------------------
-  function bind() {
-    // Modal open/close
-    if (openAuthBtn) openAuthBtn.addEventListener('click', (e) => { e.preventDefault(); openModal(); });
-    if (modalCloseBtn) modalCloseBtn.addEventListener('click', (e) => { e.preventDefault(); closeModal(); });
-    if (modalBackdrop) modalBackdrop.addEventListener('click', (e) => { e.preventDefault(); closeModal(); });
-
-    // Tabs
-    if (tabLoginBtn) tabLoginBtn.addEventListener('click', (e) => { e.preventDefault(); selectTab('login'); });
-    if (tabSignupBtn) tabSignupBtn.addEventListener('click', (e) => { e.preventDefault(); selectTab('signup'); });
-
-    // Forms
-    if (loginForm) loginForm.addEventListener('submit', doLogin);
-    if (signupForm) signupForm.addEventListener('submit', doSignup);
-
-    // Some UIs use buttons instead of submit
-    const loginSubmit = $('#loginSubmit') || $('[data-action="login"]');
-    const signupSubmit = $('#signupSubmit') || $('[data-action="signup"]');
-    if (loginSubmit) loginSubmit.addEventListener('click', doLogin);
-    if (signupSubmit) signupSubmit.addEventListener('click', doSignup);
-
-    // Logout
-    if (logoutBtn) logoutBtn.addEventListener('click', doLogout);
-
-    // Chat
-    if (chatForm) chatForm.addEventListener('submit', sendChat);
-    if (sendBtn) sendBtn.addEventListener('click', sendChat);
-
-    // Enter-to-send in textarea (Shift+Enter for newline)
-    if (chatInput) {
-      chatInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendChat(e);
-        }
-      });
-    }
-
-    // ESC closes modal
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeModal();
-    });
-
-    // Initial state
-    setLoggedIn(null);
-  }
-
-  async function boot() {
-    bind();
-
-    // Give server a moment if container just started
-    for (let i = 0; i < 3; i++) {
-      try {
-        await api('/api/health');
-        break;
-      } catch {
-        await sleep(250);
-      }
-    }
-
-    await refreshMe();
-  }
-
-  // Run
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot);
+  let data = null;
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    data = await res.json().catch(() => null);
   } else {
-    boot();
+    data = await res.text().catch(() => null);
   }
-})();
+
+  if (!res.ok) {
+    const detail = (data && data.detail) ? data.detail : (typeof data === "string" ? data : "Request failed");
+    const err = new Error(detail);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+// ----------------------------
+// DOM discovery (tolerant)
+// ----------------------------
+
+const ui = {
+  // Chat
+  chatForm: firstExisting(["#chatForm", "form#chat", "form[data-role='chat']"]),
+  chatInput: firstExisting([
+    "#prompt",
+    "#chatInput",
+    "textarea#prompt",
+    "textarea[name='prompt']",
+    "textarea[data-role='prompt']",
+    "input#prompt",
+    "input[name='prompt']",
+  ]),
+  sendBtn: firstExisting([
+    "#sendBtn",
+    "button#send",
+    "button[type='submit'][data-role='send']",
+    "button[data-action='send']",
+  ]),
+  messages: firstExisting([
+    "#messages",
+    "#chatMessages",
+    ".messages",
+    "[data-role='messages']",
+  ]),
+
+  // Auth modal + pieces
+  authModal: firstExisting([
+    "#authModal",
+    "#modal",
+    ".modal",
+    "[data-role='auth-modal']",
+  ]),
+  authBackdrop: firstExisting([
+    "#authBackdrop",
+    ".modal-backdrop",
+    "#backdrop",
+    "[data-role='auth-backdrop']",
+  ]),
+  authClose: firstExisting([
+    "#authClose",
+    "#closeModal",
+    "button[aria-label='Close']",
+    "button[data-action='close-auth']",
+    ".modal .close",
+  ]),
+
+  loginForm: firstExisting([
+    "#loginForm",
+    "form#login",
+    "form[data-role='login']",
+  ]),
+  signupForm: firstExisting([
+    "#signupForm",
+    "form#signup",
+    "form[data-role='signup']",
+  ]),
+
+  // top buttons
+  openLoginBtn: firstExisting([
+    "#openLogin",
+    "#loginBtn",
+    "button[data-action='open-login']",
+    "a[data-action='open-login']",
+  ]),
+  openSignupBtn: firstExisting([
+    "#openSignup",
+    "#signupBtn",
+    "button[data-action='open-signup']",
+    "a[data-action='open-signup']",
+  ]),
+  logoutBtn: firstExisting([
+    "#logoutBtn",
+    "button[data-action='logout']",
+    "a[data-action='logout']",
+  ]),
+
+  // Areas to toggle
+  authedOnly: $$("[data-auth='in']"),
+  unauthedOnly: $$("[data-auth='out']"),
+
+  // Debug box (optional)
+  debug: firstExisting(["#debug", "pre#debug", "[data-role='debug']"]),
+};
+
+function debugLog(...args) {
+  console.log("[ACE UI]", ...args);
+  if (ui.debug) {
+    ui.debug.textContent += args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(" ") + "\n";
+  }
+}
+
+// ----------------------------
+// Modal control
+// ----------------------------
+
+function openAuth(mode) {
+  // mode: 'login' | 'signup'
+  if (!ui.authModal) {
+    toast("Auth UI missing: auth modal not found in DOM");
+    debugLog("No authModal found. Selectors may not match your index.html.");
+    return;
+  }
+
+  show(ui.authModal);
+  if (ui.authBackdrop) show(ui.authBackdrop);
+
+  // Toggle forms if both exist
+  if (ui.loginForm && ui.signupForm) {
+    if (mode === "signup") {
+      show(ui.signupForm);
+      hide(ui.loginForm);
+    } else {
+      show(ui.loginForm);
+      hide(ui.signupForm);
+    }
+  }
+
+  // Focus first input
+  const focusTarget = firstExisting([
+    "#loginEmail",
+    "#signupEmail",
+    "input[type='email']",
+    "input[name='email']",
+  ], ui.authModal);
+  if (focusTarget) focusTarget.focus();
+}
+
+function closeAuth() {
+  hide(ui.authModal);
+  if (ui.authBackdrop) hide(ui.authBackdrop);
+}
+
+// ----------------------------
+// Chat rendering
+// ----------------------------
+
+function appendMsg(role, text) {
+  if (!ui.messages) return;
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+
+  const head = document.createElement("div");
+  head.className = "msg-head";
+  head.textContent = role === "user" ? "YOU" : "ACE";
+
+  const body = document.createElement("div");
+  body.className = "msg-body";
+  body.textContent = text; // SAFE
+
+  wrap.appendChild(head);
+  wrap.appendChild(body);
+  ui.messages.appendChild(wrap);
+  ui.messages.scrollTop = ui.messages.scrollHeight;
+}
+
+function setChatEnabled(enabled) {
+  if (ui.chatInput) ui.chatInput.disabled = !enabled;
+  if (ui.sendBtn) ui.sendBtn.disabled = !enabled;
+}
+
+// ----------------------------
+// Auth state
+// ----------------------------
+
+let authState = { loggedIn: false, user: null };
+
+function applyAuthUI() {
+  // If markup doesn't use these, harmless.
+  ui.authedOnly.forEach(el => (authState.loggedIn ? show(el) : hide(el)));
+  ui.unauthedOnly.forEach(el => (authState.loggedIn ? hide(el) : show(el)));
+  setChatEnabled(authState.loggedIn);
+}
+
+async function refreshMe() {
+  try {
+    const me = await api("/api/auth/me", { method: "GET" });
+    authState.loggedIn = !!me.logged_in;
+    authState.user = me.user || null;
+    debugLog("/api/auth/me", me);
+  } catch (e) {
+    debugLog("/api/auth/me failed", e);
+    authState.loggedIn = false;
+    authState.user = null;
+  }
+  applyAuthUI();
+}
+
+// ----------------------------
+// Event wiring (delegation)
+// ----------------------------
+
+function matchesAny(el, selectors) {
+  return selectors.some(s => {
+    try { return el.matches(s); } catch { return false; }
+  });
+}
+
+function findClickableRole(el) {
+  // climb up to allow clicks on inner spans/icons
+  let cur = el;
+  for (let i = 0; i < 4 && cur; i++) {
+    if (cur.nodeType === 1) {
+      const id = (cur.id || "").toLowerCase();
+      const act = (cur.getAttribute("data-action") || "").toLowerCase();
+      const role = (cur.getAttribute("data-role") || "").toLowerCase();
+      const txt = (cur.textContent || "").trim().toLowerCase();
+
+      // explicit actions
+      if (act === "open-login") return { type: "open-login", el: cur };
+      if (act === "open-signup") return { type: "open-signup", el: cur };
+      if (act === "logout") return { type: "logout", el: cur };
+      if (act === "close-auth") return { type: "close-auth", el: cur };
+
+      // IDs
+      if (["openlogin", "loginbtn", "login"].includes(id)) return { type: "open-login", el: cur };
+      if (["opensignup", "signupbtn", "signup", "register"].includes(id)) return { type: "open-signup", el: cur };
+      if (["logoutbtn", "logout"].includes(id)) return { type: "logout", el: cur };
+      if (["authclose", "closemodal", "close"].includes(id)) return { type: "close-auth", el: cur };
+
+      // roles
+      if (role === "open-login") return { type: "open-login", el: cur };
+      if (role === "open-signup") return { type: "open-signup", el: cur };
+
+      // text fallback
+      if (cur.tagName === "BUTTON" || cur.tagName === "A") {
+        if (txt === "login" || txt === "log in") return { type: "open-login", el: cur };
+        if (txt === "signup" || txt === "sign up" || txt === "register") return { type: "open-signup", el: cur };
+        if (txt === "logout" || txt === "log out") return { type: "logout", el: cur };
+      }
+    }
+    cur = cur.parentElement;
+  }
+  return null;
+}
+
+document.addEventListener("click", async (ev) => {
+  const hit = findClickableRole(ev.target);
+  if (!hit) return;
+
+  ev.preventDefault();
+
+  if (hit.type === "open-login") {
+    debugLog("click open-login");
+    openAuth("login");
+    return;
+  }
+  if (hit.type === "open-signup") {
+    debugLog("click open-signup");
+    openAuth("signup");
+    return;
+  }
+  if (hit.type === "close-auth") {
+    debugLog("click close-auth");
+    closeAuth();
+    return;
+  }
+  if (hit.type === "logout") {
+    debugLog("click logout");
+    try {
+      await api("/api/auth/logout", { method: "POST", body: "{}" });
+    } catch (e) {
+      debugLog("logout error", e);
+    }
+    await refreshMe();
+    toast("Logged out");
+    return;
+  }
+});
+
+// Backdrop click closes
+if (ui.authBackdrop) {
+  ui.authBackdrop.addEventListener("click", () => {
+    if (ui.authModal && isVisible(ui.authModal)) closeAuth();
+  });
+}
+
+// ESC closes
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && ui.authModal && isVisible(ui.authModal)) {
+    closeAuth();
+  }
+});
+
+// Forms: tolerate different input IDs
+function getVal(selectors, root) {
+  const el = firstExisting(selectors, root);
+  return el ? String(el.value || "").trim() : "";
+}
+
+async function doLogin(formEl) {
+  const email = getVal(["#loginEmail", "input[name='email']", "input[type='email']"], formEl);
+  const password = getVal(["#loginPassword", "input[name='password']", "input[type='password']"], formEl);
+
+  if (!email || !password) {
+    toast("Email and password required");
+    return;
+  }
+
+  try {
+    await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    closeAuth();
+    await refreshMe();
+    toast("Logged in");
+  } catch (e) {
+    debugLog("login error", e);
+    toast(`Login failed: ${e.message}`);
+  }
+}
+
+async function doSignup(formEl) {
+  const email = getVal(["#signupEmail", "input[name='email']", "input[type='email']"], formEl);
+  const password = getVal(["#signupPassword", "input[name='password']", "input[type='password']"], formEl);
+
+  if (!email || !password) {
+    toast("Email and password required");
+    return;
+  }
+
+  try {
+    await api("/api/auth/signup", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    // auto-login after signup
+    await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    });
+    closeAuth();
+    await refreshMe();
+    toast("Account created");
+  } catch (e) {
+    debugLog("signup error", e);
+    toast(`Signup failed: ${e.message}`);
+  }
+}
+
+// Attach submit listeners if forms exist
+if (ui.loginForm) {
+  ui.loginForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    doLogin(ui.loginForm);
+  });
+}
+
+if (ui.signupForm) {
+  ui.signupForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    doSignup(ui.signupForm);
+  });
+}
+
+// If buttons exist inside modal (some UIs use button click instead of submit)
+if (ui.authModal) {
+  ui.authModal.addEventListener("click", (ev) => {
+    const t = ev.target;
+    if (!(t instanceof Element)) return;
+
+    // Any button with data-action
+    const actEl = t.closest("[data-action]");
+    const act = actEl ? (actEl.getAttribute("data-action") || "").toLowerCase() : "";
+    if (act === "do-login") {
+      ev.preventDefault();
+      doLogin(ui.loginForm || ui.authModal);
+    }
+    if (act === "do-signup") {
+      ev.preventDefault();
+      doSignup(ui.signupForm || ui.authModal);
+    }
+
+    // Text fallback
+    const btn = t.closest("button");
+    const txt = (btn ? btn.textContent : "").trim().toLowerCase();
+    if (txt === "login" || txt === "log in") {
+      // If button is inside a form, submit handler already runs.
+      // If not, run explicitly.
+      if (!btn || !btn.closest("form")) {
+        ev.preventDefault();
+        doLogin(ui.loginForm || ui.authModal);
+      }
+    }
+    if (txt === "signup" || txt === "sign up" || txt === "register") {
+      if (!btn || !btn.closest("form")) {
+        ev.preventDefault();
+        doSignup(ui.signupForm || ui.authModal);
+      }
+    }
+  });
+}
+
+// ----------------------------
+// Chat submit
+// ----------------------------
+
+async function sendChat() {
+  const prompt = (ui.chatInput ? ui.chatInput.value : "").trim();
+  if (!prompt) return;
+
+  if (!authState.loggedIn) {
+    openAuth("login");
+    toast("Please log in first");
+    return;
+  }
+
+  appendMsg("user", prompt);
+  if (ui.chatInput) ui.chatInput.value = "";
+
+  setChatEnabled(false);
+  try {
+    const out = await api("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ prompt }),
+    });
+    appendMsg("ace", out.response || "");
+  } catch (e) {
+    debugLog("chat error", e);
+    toast(`Chat failed: ${e.message}`);
+  } finally {
+    setChatEnabled(true);
+  }
+}
+
+// If your UI has a form, hook submit
+if (ui.chatForm) {
+  ui.chatForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    sendChat();
+  });
+}
+
+// If it doesn't, hook send button
+if (ui.sendBtn) {
+  ui.sendBtn.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    sendChat();
+  });
+}
+
+// Enter-to-send for textarea/input if desired (only if not multi-line textarea)
+if (ui.chatInput) {
+  ui.chatInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      // If it's a textarea we still treat Enter as send unless Shift
+      ev.preventDefault();
+      sendChat();
+    }
+  });
+}
+
+// ----------------------------
+// Boot
+// ----------------------------
+
+window.addEventListener("load", async () => {
+  debugLog("boot", {
+    authModal: !!ui.authModal,
+    loginForm: !!ui.loginForm,
+    signupForm: !!ui.signupForm,
+    chatInput: !!ui.chatInput,
+  });
+
+  // If UI lacks explicit buttons, it still works via delegation.
+  // Make chat disabled until logged in.
+  setChatEnabled(false);
+  await refreshMe();
+});
