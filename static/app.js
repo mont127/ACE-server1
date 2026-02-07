@@ -40,8 +40,17 @@
     try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
 
     if (!res.ok) {
-      const detail = (data && (data.detail || data.message)) ? (data.detail || data.message) : `HTTP ${res.status}`;
-      throw new Error(detail);
+      let detail = null;
+      if (data && (data.detail !== undefined)) detail = data.detail;
+      else if (data && (data.message !== undefined)) detail = data.message;
+      else if (data && (data.error !== undefined)) detail = data.error;
+
+      // FastAPI sometimes returns detail as an object
+      if (detail && typeof detail === 'object') {
+        try { detail = JSON.stringify(detail); } catch { detail = String(detail); }
+      }
+      if (!detail) detail = `HTTP ${res.status}`;
+      throw new Error(String(detail));
     }
     return data;
   }
@@ -98,8 +107,10 @@
     const btnSignup = $('btnSignup');
     const btnLogout = $('btnLogout');
 
-    if (me && me.email) {
-      if (authPill) authPill.textContent = `logged in: ${me.email}`;
+    const ident = (me && (me.email || me.username)) ? (me.email || me.username) : '';
+
+    if (ident) {
+      if (authPill) authPill.textContent = `logged in: ${ident}`;
       if (btnLogin) btnLogin.style.display = 'none';
       if (btnSignup) btnSignup.style.display = 'none';
       if (btnLogout) btnLogout.style.display = '';
@@ -134,12 +145,21 @@
   }
 
   async function signup(email, password) {
-    const out = await api('/api/auth/signup', { method: 'POST', body: { email, password } });
+    // Backend expects `username` (and may also accept `email`).
+    // We send both to stay compatible with either schema.
+    const out = await api('/api/auth/signup', {
+      method: 'POST',
+      body: { username: email, email, password },
+    });
     return out;
   }
 
   async function login(email, password) {
-    const out = await api('/api/auth/login', { method: 'POST', body: { email, password } });
+    // Backend expects `username` (and may also accept `email`).
+    const out = await api('/api/auth/login', {
+      method: 'POST',
+      body: { username: email, email, password },
+    });
     return out;
   }
 
@@ -204,7 +224,7 @@
           await refreshMe();
           showBanner('Logged in', false);
         } catch (err) {
-          showBanner(`Login failed: ${err.message}`, true);
+          showBanner(`Login failed: ${err?.message || String(err)}`, true);
         }
       });
     }
@@ -223,7 +243,7 @@
           await refreshMe();
           showBanner('Account created + logged in', false);
         } catch (err) {
-          showBanner(`Signup failed: ${err.message}`, true);
+          showBanner(`Signup failed: ${err?.message || String(err)}`, true);
         }
       });
     }
@@ -271,6 +291,8 @@
       await refreshMe();
       addMessage('ace', 'ACE online. Login or sign up to chat.');
     } catch (e) {
+
+
       showBanner(`Startup error: ${e.message}`, true);
       log('startup failed', e);
     }
