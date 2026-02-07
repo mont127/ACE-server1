@@ -1,59 +1,93 @@
-/* static/app.js
-   ACE Web UI — login/signup + chat
-   - Uses cookie-based session from backend
-   - IMPORTANT: credentials: "include" so cookies are sent on /api/chat
+/*
+  ACE Web UI - app.js (fixed)
+  - Defensive DOM binding (won't crash if an element is missing)
+  - Login / Signup modal works
+  - Chat works only when logged in
+  - Uses cookies via fetch(..., { credentials: 'include' })
+  - Minimal XSS safety: render model output as textContent (never innerHTML)
 */
 
 (() => {
-  // ---------- Helpers ----------
+  'use strict';
+
+  // -------------------------
+  // Helpers
+  // -------------------------
   const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-  function esc(s) {
-    return String(s ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#039;");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function safeText(el, text) {
+    if (!el) return;
+    el.textContent = String(text ?? '');
   }
 
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+  function show(el) {
+    if (!el) return;
+    el.classList.remove('hidden');
+    el.style.display = '';
   }
 
-  function getLocalSessionId() {
-    let sid = localStorage.getItem("ace_session_id");
-    if (!sid) {
-      sid = (crypto?.randomUUID?.() || Math.random().toString(16).slice(2) + Date.now().toString(16));
-      localStorage.setItem("ace_session_id", sid);
+  function hide(el) {
+    if (!el) return;
+    el.classList.add('hidden');
+    el.style.display = 'none';
+  }
+
+  function setDisabled(el, disabled) {
+    if (!el) return;
+    el.disabled = !!disabled;
+    if (disabled) el.setAttribute('aria-disabled', 'true');
+    else el.removeAttribute('aria-disabled');
+  }
+
+  function toast(msg, kind = 'info') {
+    // If your HTML has a toast element, use it; otherwise fallback to console + alert for errors.
+    const t = $('#toast') || $('#status') || $('#banner');
+    if (t) {
+      t.classList.remove('hidden');
+      t.dataset.kind = kind;
+      safeText(t, msg);
+      // auto-hide after a bit
+      clearTimeout(toast._tm);
+      toast._tm = setTimeout(() => {
+        // do not hide persistent banners if user wants to keep them; ok to hide here.
+        t.classList.add('hidden');
+      }, 3500);
+    } else {
+      if (kind === 'error') {
+        console.error(msg);
+        // avoid spamming alerts; only alert for error.
+        alert(msg);
+      } else {
+        console.log(msg);
+      }
     }
-    return sid;
   }
 
-  async function api(path, { method = "GET", body = null } = {}) {
+  async function api(path, { method = 'GET', body = null, headers = {} } = {}) {
     const opts = {
       method,
-      headers: { "Content-Type": "application/json" },
-      credentials: "include", // <-- critical for cookie-based auth
+      credentials: 'include',
+      headers: {
+        ...headers,
+      },
     };
-    if (body !== null) opts.body = JSON.stringify(body);
 
-    const res = await fetch(path, opts);
-
-    let data = null;
-    const ct = res.headers.get("content-type") || "";
-    if (ct.includes("application/json")) {
-      data = await res.json().catch(() => null);
-    } else {
-      data = await res.text().catch(() => null);
+    if (body !== null) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
     }
 
+    const res = await fetch(path, opts);
+    const ct = res.headers.get('content-type') || '';
+    const isJson = ct.includes('application/json');
+    const data = isJson ? await res.json().catch(() => ({})) : await res.text().catch(() => '');
+
     if (!res.ok) {
-      const msg =
-        (data && typeof data === "object" && (data.detail || data.error || data.message)) ||
-        (typeof data === "string" && data) ||
-        `HTTP ${res.status}`;
-      const err = new Error(msg);
+      const detail = (data && data.detail) ? data.detail : (typeof data === 'string' ? data : 'Request failed');
+      const err = new Error(detail);
       err.status = res.status;
       err.data = data;
       throw err;
@@ -62,266 +96,351 @@
     return data;
   }
 
-  // ---------- DOM ----------
-  // Expected IDs/classes (match your index.html):
-  // #authView, #chatView
-  // #loginForm, #signupForm
-  // #loginUser, #loginPass, #signupUser, #signupPass
-  // #authError, #chatError
-  // #logoutBtn
-  // #healthLine
-  // #chatLog
-  // #promptInput, #sendBtn
-  // #acwToggle (optional checkbox), #maxTokens (optional), #temp (optional), #topP (optional)
-  const authView = $("#authView");
-  const chatView = $("#chatView");
+  // -------------------------
+  // State
+  // -------------------------
+  const state = {
+    user: null,
+    sessionId: null,
+    busy: false,
+  };
 
-  const loginForm = $("#loginForm");
-  const signupForm = $("#signupForm");
-  const loginUser = $("#loginUser");
-  const loginPass = $("#loginPass");
-  const signupUser = $("#signupUser");
-  const signupPass = $("#signupPass");
-  const authError = $("#authError");
+  // -------------------------
+  // DOM refs (optional)
+  // -------------------------
+  // Modal
+  const modal = $('#authModal') || $('#modal') || $('.modal');
+  const modalBackdrop = $('#authBackdrop') || $('#modalBackdrop') || $('.modal-backdrop');
+  const modalCloseBtn = $('#authClose') || $('#modalClose') || $('#closeModal') || $('.modal-close');
 
-  const logoutBtn = $("#logoutBtn");
-  const healthLine = $("#healthLine");
-  const chatError = $("#chatError");
+  // Tabs / forms
+  const tabLoginBtn = $('#tabLogin') || $('[data-tab="login"]');
+  const tabSignupBtn = $('#tabSignup') || $('[data-tab="signup"]');
 
-  const chatLog = $("#chatLog");
-  const promptInput = $("#promptInput");
-  const sendBtn = $("#sendBtn");
+  const loginForm = $('#loginForm') || $('#formLogin') || $('[data-form="login"]');
+  const signupForm = $('#signupForm') || $('#formSignup') || $('[data-form="signup"]');
 
-  const acwToggle = $("#acwToggle"); // optional
-  const maxTokensEl = $("#maxTokens"); // optional
-  const tempEl = $("#temp"); // optional
-  const topPEl = $("#topP"); // optional
+  // Buttons
+  const openAuthBtn = $('#openAuth') || $('#loginBtn') || $('#btnLogin') || $('[data-action="open-auth"]');
+  const logoutBtn = $('#logoutBtn') || $('#btnLogout') || $('[data-action="logout"]');
 
-  // ---------- UI Render ----------
-  function showAuth(msg = "") {
-    if (authView) authView.style.display = "";
-    if (chatView) chatView.style.display = "none";
-    if (authError) {
-      authError.textContent = msg || "";
-      authError.style.display = msg ? "" : "none";
+  // Status area
+  const whoamiEl = $('#whoami') || $('#userLabel') || $('#userEmail');
+  const authHintEl = $('#authHint') || $('#authStatus');
+
+  // Chat
+  const chatForm = $('#chatForm') || $('#formChat') || $('[data-form="chat"]');
+  const chatInput = $('#chatInput') || $('#prompt') || $('#input') || $('textarea');
+  const sendBtn = $('#sendBtn') || $('#btnSend') || $('[data-action="send"]');
+  const chatLog = $('#chatLog') || $('#messages') || $('#chat') || $('#output');
+
+  // -------------------------
+  // Modal control
+  // -------------------------
+  function openModal() {
+    if (!modal) {
+      toast('Auth UI not found in index.html (missing #authModal).', 'error');
+      return;
     }
-    if (chatError) {
-      chatError.textContent = "";
-      chatError.style.display = "none";
-    }
+    show(modal);
+    if (modalBackdrop) show(modalBackdrop);
+    // default to login tab
+    selectTab('login');
   }
 
-  function showChat() {
-    if (authView) authView.style.display = "none";
-    if (chatView) chatView.style.display = "";
-    if (authError) {
-      authError.textContent = "";
-      authError.style.display = "none";
-    }
-    if (chatError) {
-      chatError.textContent = "";
-      chatError.style.display = "none";
-    }
-    promptInput?.focus?.();
+  function closeModal() {
+    if (!modal) return;
+    hide(modal);
+    if (modalBackdrop) hide(modalBackdrop);
   }
 
-  function setBusy(busy) {
-    if (sendBtn) sendBtn.disabled = !!busy;
-    if (promptInput) promptInput.disabled = !!busy;
-    if (busy) {
-      sendBtn && (sendBtn.textContent = "Thinking…");
+  function selectTab(which) {
+    const w = (which || 'login').toLowerCase();
+
+    if (loginForm) {
+      if (w === 'login') show(loginForm); else hide(loginForm);
+    }
+    if (signupForm) {
+      if (w === 'signup') show(signupForm); else hide(signupForm);
+    }
+
+    // Optional tab button styles
+    if (tabLoginBtn) tabLoginBtn.classList.toggle('active', w === 'login');
+    if (tabSignupBtn) tabSignupBtn.classList.toggle('active', w === 'signup');
+  }
+
+  // -------------------------
+  // UI updates
+  // -------------------------
+  function setLoggedIn(user) {
+    state.user = user || null;
+    const loggedIn = !!state.user;
+
+    if (loggedIn) {
+      safeText(whoamiEl, state.user.email || state.user.username || 'Logged in');
+      safeText(authHintEl, '');
+      if (openAuthBtn) hide(openAuthBtn);
+      if (logoutBtn) show(logoutBtn);
+      if (chatInput) chatInput.placeholder = 'Ask ACE…';
+      setDisabled(chatInput, false);
+      setDisabled(sendBtn, false);
+      closeModal();
     } else {
-      sendBtn && (sendBtn.textContent = "Send");
+      safeText(whoamiEl, 'Guest');
+      safeText(authHintEl, 'Log in to chat');
+      if (openAuthBtn) show(openAuthBtn);
+      if (logoutBtn) hide(logoutBtn);
+      if (chatInput) chatInput.placeholder = 'Log in to chat…';
+      setDisabled(chatInput, true);
+      setDisabled(sendBtn, true);
     }
   }
 
-  function appendMsg(role, text) {
+  function appendMessage(role, text) {
     if (!chatLog) return;
 
-    const wrap = document.createElement("div");
-    wrap.className = `msg ${role}`;
+    const line = document.createElement('div');
+    line.className = `msg ${role}`;
 
-    const header = document.createElement("div");
-    header.className = "msgHeader";
-    header.textContent = role === "user" ? "YOU" : "ACE";
+    const header = document.createElement('div');
+    header.className = 'msg-head';
+    header.textContent = role === 'user' ? 'YOU' : 'ACE';
 
-    const body = document.createElement("div");
-    body.className = "msgBody";
-    // Safe render:
-    body.innerHTML = esc(text).replace(/\n/g, "<br>");
+    const body = document.createElement('pre');
+    body.className = 'msg-body';
+    // IMPORTANT: avoid XSS by using textContent
+    body.textContent = String(text ?? '');
 
-    wrap.appendChild(header);
-    wrap.appendChild(body);
+    line.appendChild(header);
+    line.appendChild(body);
+    chatLog.appendChild(line);
 
-    chatLog.appendChild(wrap);
+    // scroll to bottom
     chatLog.scrollTop = chatLog.scrollHeight;
   }
 
-  function setChatError(msg = "") {
-    if (!chatError) return;
-    chatError.textContent = msg || "";
-    chatError.style.display = msg ? "" : "none";
+  function setBusy(b) {
+    state.busy = !!b;
+    setDisabled(sendBtn, b || !state.user);
+    if (chatInput) setDisabled(chatInput, b || !state.user);
+    if (sendBtn) sendBtn.textContent = b ? 'Thinking…' : 'Send';
   }
 
-  // ---------- Auth ----------
+  // -------------------------
+  // Auth actions
+  // -------------------------
   async function refreshMe() {
-    // backend should return {logged_in: true, username: "..."} or 401
     try {
-      const me = await api("/api/auth/me");
-      if (me && (me.logged_in || me.username)) {
-        showChat();
-        return true;
+      const me = await api('/api/auth/me');
+      // Expected shapes: { logged_in: true, user: {..} } OR { user: {..} } OR { logged_in:false }
+      if (me && (me.logged_in === false || me.user === null)) {
+        setLoggedIn(null);
+        return;
       }
-      showAuth("");
-      return false;
+      if (me && me.user) {
+        setLoggedIn(me.user);
+        return;
+      }
+      // fallback: if endpoint returns user directly
+      if (me && (me.email || me.username)) {
+        setLoggedIn(me);
+        return;
+      }
+      setLoggedIn(null);
     } catch (e) {
-      showAuth("");
-      return false;
+      // If /api/auth/me not implemented or errors, treat as logged out
+      console.warn('refreshMe failed:', e);
+      setLoggedIn(null);
     }
   }
 
-  async function doSignup(username, password) {
-    await api("/api/auth/signup", { method: "POST", body: { username, password } });
+  function getFormVal(form, name, fallbackSel) {
+    if (!form) return '';
+    const byName = form.querySelector(`[name="${name}"]`);
+    if (byName) return (byName.value || '').trim();
+    const bySel = fallbackSel ? form.querySelector(fallbackSel) : null;
+    if (bySel) return (bySel.value || '').trim();
+    return '';
   }
 
-  async function doLogin(username, password) {
-    await api("/api/auth/login", { method: "POST", body: { username, password } });
-  }
+  async function doSignup(ev) {
+    ev?.preventDefault?.();
+    if (!signupForm) {
+      toast('Signup form not found in HTML.', 'error');
+      return;
+    }
 
-  async function doLogout() {
+    const email = getFormVal(signupForm, 'email', '#signupEmail');
+    const password = getFormVal(signupForm, 'password', '#signupPassword');
+
+    if (!email || !password) {
+      toast('Enter email + password.', 'error');
+      return;
+    }
+
     try {
-      await api("/api/auth/logout", { method: "POST", body: {} });
-    } catch (_) {
-      // ignore
+      setBusy(true);
+      await api('/api/auth/signup', { method: 'POST', body: { email, password } });
+      toast('Account created. Logging in…');
+      await api('/api/auth/login', { method: 'POST', body: { email, password } });
+      await refreshMe();
+    } catch (e) {
+      toast(`Signup failed: ${e.message}`, 'error');
+    } finally {
+      setBusy(false);
     }
-    showAuth("");
   }
 
-  // ---------- Chat ----------
-  function buildPrompt(raw) {
-    const text = (raw || "").trim();
-    if (!text) return "";
+  async function doLogin(ev) {
+    ev?.preventDefault?.();
+    if (!loginForm) {
+      toast('Login form not found in HTML.', 'error');
+      return;
+    }
 
-    const acwOn = !!acwToggle?.checked;
-    if (acwOn && !/\s+acw$/i.test(text)) return `${text} ACW`;
-    return text;
+    const email = getFormVal(loginForm, 'email', '#loginEmail');
+    const password = getFormVal(loginForm, 'password', '#loginPassword');
+
+    if (!email || !password) {
+      toast('Enter email + password.', 'error');
+      return;
+    }
+
+    try {
+      setBusy(true);
+      await api('/api/auth/login', { method: 'POST', body: { email, password } });
+      await refreshMe();
+    } catch (e) {
+      toast(`Login failed: ${e.message}`, 'error');
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function readTuning() {
-    // optional; backend may ignore these
-    const max_new_tokens = maxTokensEl ? parseInt(maxTokensEl.value || "", 10) : undefined;
-    const temperature = tempEl ? parseFloat(tempEl.value || "") : undefined;
-    const top_p = topPEl ? parseFloat(topPEl.value || "") : undefined;
-
-    const out = {};
-    if (Number.isFinite(max_new_tokens) && max_new_tokens > 0) out.max_new_tokens = max_new_tokens;
-    if (Number.isFinite(temperature) && temperature > 0) out.temperature = temperature;
-    if (Number.isFinite(top_p) && top_p > 0 && top_p <= 1) out.top_p = top_p;
-    return out;
+  async function doLogout(ev) {
+    ev?.preventDefault?.();
+    try {
+      setBusy(true);
+      await api('/api/auth/logout', { method: 'POST' });
+    } catch (e) {
+      // If not implemented, still clear UI
+      console.warn('logout failed:', e);
+    } finally {
+      setBusy(false);
+      setLoggedIn(null);
+      toast('Logged out');
+    }
   }
 
-  async function sendChat() {
-    setChatError("");
+  // -------------------------
+  // Chat action
+  // -------------------------
+  async function sendChat(ev) {
+    ev?.preventDefault?.();
 
-    const raw = promptInput?.value ?? "";
-    const prompt = buildPrompt(raw);
+    if (!state.user) {
+      openModal();
+      return;
+    }
+
+    const prompt = (chatInput?.value || '').trim();
     if (!prompt) return;
 
-    promptInput.value = "";
-    appendMsg("user", prompt);
-
-    setBusy(true);
-
-    const session_id = getLocalSessionId();
-    const tuning = readTuning();
+    // clear input early
+    if (chatInput) chatInput.value = '';
+    appendMessage('user', prompt);
 
     try {
-      const payload = { prompt, session_id, ...tuning };
-      const out = await api("/api/chat", { method: "POST", body: payload });
+      setBusy(true);
+      const out = await api('/api/chat', {
+        method: 'POST',
+        body: { prompt, session_id: state.sessionId || null },
+      });
 
-      // expected: {session_id, response, device, model}
-      if (out?.session_id) localStorage.setItem("ace_session_id", out.session_id);
-      appendMsg("ace", out?.response ?? "[No response]");
+      if (out && out.session_id) state.sessionId = out.session_id;
+      appendMessage('ace', out?.response ?? '');
     } catch (e) {
-      const msg = e?.message || "Request failed";
-      setChatError(msg);
+      appendMessage('ace', `[ERROR] ${e.message}`);
+      toast(`Chat failed: ${e.message}`, 'error');
 
-      // If auth expired, bounce to login
-      if (e?.status === 401) {
-        showAuth("Session expired. Please log in again.");
+      // If auth expired, force refresh
+      if (e.status === 401) {
+        await refreshMe();
       }
     } finally {
       setBusy(false);
     }
   }
 
-  // ---------- Startup ----------
-  async function loadHealth() {
-    if (!healthLine) return;
-    try {
-      const h = await api("/api/health");
-      // expected: {ok, model, device, queue_max_waiters?}
-      const bits = [];
-      if (h?.model) bits.push(`Model: ${h.model}`);
-      if (h?.device) bits.push(`Device: ${h.device}`);
-      if (h?.queue_max_waiters !== undefined) bits.push(`Queue: ${h.queue_max_waiters}`);
-      healthLine.textContent = bits.join(" • ") || "OK";
-    } catch (_) {
-      healthLine.textContent = "Health check failed";
+  // -------------------------
+  // Bind events (after DOM is ready)
+  // -------------------------
+  function bind() {
+    // Modal open/close
+    if (openAuthBtn) openAuthBtn.addEventListener('click', (e) => { e.preventDefault(); openModal(); });
+    if (modalCloseBtn) modalCloseBtn.addEventListener('click', (e) => { e.preventDefault(); closeModal(); });
+    if (modalBackdrop) modalBackdrop.addEventListener('click', (e) => { e.preventDefault(); closeModal(); });
+
+    // Tabs
+    if (tabLoginBtn) tabLoginBtn.addEventListener('click', (e) => { e.preventDefault(); selectTab('login'); });
+    if (tabSignupBtn) tabSignupBtn.addEventListener('click', (e) => { e.preventDefault(); selectTab('signup'); });
+
+    // Forms
+    if (loginForm) loginForm.addEventListener('submit', doLogin);
+    if (signupForm) signupForm.addEventListener('submit', doSignup);
+
+    // Some UIs use buttons instead of submit
+    const loginSubmit = $('#loginSubmit') || $('[data-action="login"]');
+    const signupSubmit = $('#signupSubmit') || $('[data-action="signup"]');
+    if (loginSubmit) loginSubmit.addEventListener('click', doLogin);
+    if (signupSubmit) signupSubmit.addEventListener('click', doSignup);
+
+    // Logout
+    if (logoutBtn) logoutBtn.addEventListener('click', doLogout);
+
+    // Chat
+    if (chatForm) chatForm.addEventListener('submit', sendChat);
+    if (sendBtn) sendBtn.addEventListener('click', sendChat);
+
+    // Enter-to-send in textarea (Shift+Enter for newline)
+    if (chatInput) {
+      chatInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendChat(e);
+        }
+      });
     }
+
+    // ESC closes modal
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeModal();
+    });
+
+    // Initial state
+    setLoggedIn(null);
   }
 
-  function wireEvents() {
-    loginForm?.addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      if (!loginUser?.value || !loginPass?.value) return showAuth("Enter username + password.");
+  async function boot() {
+    bind();
+
+    // Give server a moment if container just started
+    for (let i = 0; i < 3; i++) {
       try {
-        showAuth("");
-        await doLogin(loginUser.value.trim(), loginPass.value);
-        await refreshMe();
-      } catch (e) {
-        showAuth(e?.message || "Login failed");
+        await api('/api/health');
+        break;
+      } catch {
+        await sleep(250);
       }
-    });
+    }
 
-    signupForm?.addEventListener("submit", async (ev) => {
-      ev.preventDefault();
-      if (!signupUser?.value || !signupPass?.value) return showAuth("Enter username + password.");
-      try {
-        showAuth("");
-        await doSignup(signupUser.value.trim(), signupPass.value);
-        // auto-login after signup
-        await doLogin(signupUser.value.trim(), signupPass.value);
-        await refreshMe();
-      } catch (e) {
-        showAuth(e?.message || "Signup failed");
-      }
-    });
-
-    logoutBtn?.addEventListener("click", async () => {
-      await doLogout();
-    });
-
-    sendBtn?.addEventListener("click", sendChat);
-
-    promptInput?.addEventListener("keydown", (ev) => {
-      // Enter to send, Shift+Enter for newline
-      if (ev.key === "Enter" && !ev.shiftKey) {
-        ev.preventDefault();
-        sendChat();
-      }
-    });
-  }
-
-  async function init() {
-    wireEvents();
-    await loadHealth();
     await refreshMe();
-
-    // tiny delay so UI feels stable
-    await sleep(50);
-    promptInput?.focus?.();
   }
 
-  init();
+  // Run
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
 })();
