@@ -1,16 +1,20 @@
 services:
   ace:
     build: .
-    image: ace:latest
     container_name: ace
     restart: unless-stopped
-    environment:
-      - ACE_MODEL=Qwen/Qwen2.5-0.5B-Instruct
-      - ACE_MAX_NEW_TOKENS=7000
-      - ACE_MEM_DIR=/app/mem
-      # Optional security:
-      # - ACE_API_KEY=change-me
     ports:
       - "8000:8000"
+    environment:
+      - ACE_MEM_DIR=mem
+      - ACE_DATA_DIR=data
+      - ACE_DB_PATH=data/ace.db
+      - ACE_MAX_PROMPT_CHARS=8000
+      - ACE_QUEUE_MAX_WAITERS=32
+      # If you later put it behind HTTPS reverse proxy, set:
+      # - ACE_COOKIE_SECURE=1
+      # Optional API key:
+      # - ACE_API_KEY=change-me
     volumes:
       - ./mem:/app/mem
+      - ./data:/app/data

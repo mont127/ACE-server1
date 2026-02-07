@@ -7,23 +7,59 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="app">
+  <div id="app">
     <header class="topbar">
-      <div>
-        <div class="title">ACE v7.3</div>
-        <div class="subtitle" id="status">Connecting…</div>
+      <div class="title">
+        <div class="h1">ACE v7.3</div>
+        <div class="sub" id="modelLine">Loading…</div>
       </div>
-      <div class="right">
-        <button id="clear" class="btn">Clear</button>
+
+      <div class="top-actions">
+        <button id="authBtn" class="btn">Login</button>
+        <button id="logoutBtn" class="btn hidden">Logout</button>
+        <button id="clearBtn" class="btn">Clear</button>
       </div>
     </header>
 
-    <main class="chat" id="chat"></main>
+    <main>
+      <div id="chat" class="chat"></div>
+    </main>
 
     <footer class="composer">
-      <textarea id="prompt" rows="3" placeholder="Type a message… (add ' ACW' at the end to enable ACW)"></textarea>
-      <button id="send" class="btn primary">Send</button>
+      <textarea id="input" placeholder="Type a message…" rows="2"></textarea>
+      <button id="sendBtn" class="btn primary">Send</button>
     </footer>
+  </div>
+
+  <!-- Auth modal -->
+  <div id="authModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">Account</div>
+        <button id="authClose" class="btn">X</button>
+      </div>
+
+      <div class="tabs">
+        <button id="tabLogin" class="tab active">Login</button>
+        <button id="tabSignup" class="tab">Sign up</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="row">
+          <label>Username</label>
+          <input id="authUser" type="text" autocomplete="username" />
+        </div>
+        <div class="row">
+          <label>Password</label>
+          <input id="authPass" type="password" autocomplete="current-password" />
+        </div>
+        <div id="authError" class="error"></div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="authSubmit" class="btn primary">Login</button>
+      </div>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>
