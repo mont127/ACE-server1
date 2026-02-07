@@ -6,7 +6,6 @@
   <title>ACE</title>
   <link rel="stylesheet" href="/static/style.css" />
   <style>
-    /* minimal fail-safe styles if style.css is missing */
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#0b0b0c;color:#eaeaea}
     .topbar{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #222;position:sticky;top:0;background:#0b0b0c;z-index:10}
     .btn{cursor:pointer;border:1px solid #2b2b2b;background:#151518;color:#eaeaea;padding:10px 12px;border-radius:10px}
@@ -25,14 +24,6 @@
     textarea{flex:1;resize:vertical;min-height:44px;max-height:180px;border-radius:12px;border:1px solid #2b2b2b;background:#0b0b0c;color:#eaeaea;padding:10px}
     .banner{display:none;margin:12px 0;padding:10px 12px;border-radius:12px;border:1px solid #442;background:#241;}
     .banner.show{display:block}
-    .modalBackdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);align-items:center;justify-content:center;z-index:50;padding:18px}
-    .modalBackdrop.show{display:flex}
-    .modal{width:min(520px,100%);background:#0f0f12;border:1px solid #2b2b2b;border-radius:16px;box-shadow:0 20px 80px rgba(0,0,0,.55)}
-    .modalHeader{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #222}
-    .modalTitle{font-weight:700}
-    .modalBody{padding:14px;display:flex;flex-direction:column;gap:10px}
-    .field{display:flex;flex-direction:column;gap:6px}
-    input{border-radius:12px;border:1px solid #2b2b2b;background:#0b0b0c;color:#eaeaea;padding:10px}
     .muted{color:#a9a9a9;font-size:12px}
     .spacer{height:8px}
   </style>
@@ -42,12 +33,11 @@
     <div class="row">
       <div style="font-weight:800;letter-spacing:.5px">ACE</div>
       <div id="healthPill" class="pill">checking…</div>
-      <div id="authPill" class="pill">not logged in</div>
+      <div id="modePill" class="pill">guest</div>
+      <div id="queuePill" class="pill" style="display:none"></div>
     </div>
     <div class="row">
-      <button id="btnLogin" class="btn">Login</button>
-      <button id="btnSignup" class="btn">Sign up</button>
-      <button id="btnLogout" class="btn" style="display:none">Logout</button>
+      <button id="btnClear" class="btn">Clear</button>
     </div>
   </div>
 
@@ -68,57 +58,7 @@
     </div>
   </div>
 
-  <!-- LOGIN MODAL -->
-  <div id="loginBackdrop" class="modalBackdrop" aria-hidden="true">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
-      <div class="modalHeader">
-        <div id="loginTitle" class="modalTitle">Login</div>
-        <button id="loginClose" class="btn" aria-label="Close">✕</button>
-      </div>
-      <div class="modalBody">
-        <form id="loginForm">
-          <div class="field">
-            <label>Email</label>
-            <input id="loginEmail" type="email" autocomplete="email" required />
-          </div>
-          <div class="field">
-            <label>Password</label>
-            <input id="loginPassword" type="password" autocomplete="current-password" required />
-          </div>
-          <div class="spacer"></div>
-          <button class="btn primary" type="submit">Login</button>
-          <div class="muted">No account? Use Sign up.</div>
-        </form>
-      </div>
-    </div>
-  </div>
-
-  <!-- SIGNUP MODAL -->
-  <div id="signupBackdrop" class="modalBackdrop" aria-hidden="true">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="signupTitle">
-      <div class="modalHeader">
-        <div id="signupTitle" class="modalTitle">Sign up</div>
-        <button id="signupClose" class="btn" aria-label="Close">✕</button>
-      </div>
-      <div class="modalBody">
-        <form id="signupForm">
-          <div class="field">
-            <label>Email</label>
-            <input id="signupEmail" type="email" autocomplete="email" required />
-          </div>
-          <div class="field">
-            <label>Password</label>
-            <input id="signupPassword" type="password" autocomplete="new-password" required minlength="6" />
-          </div>
-          <div class="spacer"></div>
-          <button class="btn primary" type="submit">Create account</button>
-          <div class="muted">Already have an account? Use Login.</div>
-        </form>
-      </div>
-    </div>
-  </div>
-
-  <!-- Cache-bust so Rocky/Browser doesn’t keep old broken JS -->
-  <script src="/static/app.js?v=20260207_1705"></script>
+  <!-- Cache-bust so browsers don’t keep old JS -->
+  <script src="/static/app.js?v=guest_20260207_1800"></script>
 </body>
 </html>

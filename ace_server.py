@@ -65,17 +65,20 @@ def db() -> sqlite3.Connection:
 def init_db() -> None:
     conn = db()
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
+            email TEXT UNIQUE,
             salt BLOB NOT NULL,
             pw_hash BLOB NOT NULL,
             created_at INTEGER NOT NULL
         );
         """
     )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS sessions (
@@ -87,8 +90,21 @@ def init_db() -> None:
         );
         """
     )
+
+    # lightweight migration for older DBs (safe)
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    except sqlite3.OperationalError:
+        pass  # already exists
+
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
+
 
 
 def _now() -> int:
@@ -103,13 +119,47 @@ def _pbkdf2_hash(password: str, salt: bytes) -> bytes:
 def _consteq(a: bytes, b: bytes) -> bool:
     return hmac.compare_digest(a, b)
 
+def _is_valid_email(email: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email.strip()))
 
-def create_user(username: str, password: str) -> int:
-    username = username.strip()
-    if not (3 <= len(username) <= 32) or not re.fullmatch(r"[A-Za-z0-9_\-\.]+", username):
-        raise HTTPException(status_code=400, detail="username must be 3-32 chars and only A-Z a-z 0-9 _ - .")
+def _username_from_email(email: str) -> str:
+    local = email.split("@", 1)[0].strip().lower()
+    local = re.sub(r"[^a-z0-9_\-\.]", "_", local)
+    local = re.sub(r"_+", "_", local).strip("._-")
+    return (local or "user")[:24]
+
+def _unique_username(base: str) -> str:
+    conn = db()
+    cur = conn.cursor()
+    candidate = base
+    for _ in range(25):
+        cur.execute("SELECT 1 FROM users WHERE username = ?", (candidate,))
+        if not cur.fetchone():
+            conn.close()
+            return candidate
+        candidate = f"{base}_{secrets.token_hex(3)}"
+        candidate = candidate[:32]
+    conn.close()
+    return f"{base}_{secrets.token_hex(4)}"[:32]
+
+def create_user(username: Optional[str], email: Optional[str], password: str) -> int:
+    username = (username or "").strip()
+    email = (email or "").strip().lower()
+
+    if not username and not email:
+        raise HTTPException(status_code=400, detail="username or email is required")
+
+    if email and not _is_valid_email(email):
+        raise HTTPException(status_code=400, detail="invalid email")
+
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+
+    if not username:
+        username = _unique_username(_username_from_email(email))
+
+    if not (3 <= len(username) <= 32) or not re.fullmatch(r"[A-Za-z0-9_\-\.]+", username):
+        raise HTTPException(status_code=400, detail="username must be 3-32 chars and only A-Z a-z 0-9 _ - .")
 
     salt = secrets.token_bytes(16)
     pw_hash = _pbkdf2_hash(password, salt)
@@ -118,23 +168,35 @@ def create_user(username: str, password: str) -> int:
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO users (username, salt, pw_hash, created_at) VALUES (?, ?, ?, ?)",
-            (username, salt, pw_hash, _now()),
+            "INSERT INTO users (username, email, salt, pw_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            (username, email if email else None, salt, pw_hash, _now()),
         )
         conn.commit()
-        user_id = int(cur.lastrowid)
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="username already exists")
+        return int(cur.lastrowid)
+    except sqlite3.IntegrityError as e:
+        msg = str(e).lower()
+        if "username" in msg:
+            raise HTTPException(status_code=409, detail="username already exists")
+        if "email" in msg:
+            raise HTTPException(status_code=409, detail="email already exists")
+        raise HTTPException(status_code=409, detail="user already exists")
     finally:
         conn.close()
 
-    return user_id
 
+def verify_user(identifier: str, password: str) -> Optional[int]:
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
 
-def verify_user(username: str, password: str) -> Optional[int]:
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT id, salt, pw_hash FROM users WHERE username = ?", (username.strip(),))
+
+    if "@" in ident:
+        cur.execute("SELECT id, salt, pw_hash FROM users WHERE email = ?", (ident.lower(),))
+    else:
+        cur.execute("SELECT id, salt, pw_hash FROM users WHERE username = ?", (ident,))
+
     row = cur.fetchone()
     conn.close()
 
@@ -411,7 +473,36 @@ def save_mem_for_user(user_id: int, mem: Dict[str, Any]) -> None:
     except Exception:
         pass
 
+def _safe_session_id(s: Optional[str]) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "guest"
+    s = re.sub(r"[^a-zA-Z0-9_\-]", "", s)
+    return (s[:64] or "guest")
 
+
+def _mem_path_for_session(session_id: str) -> str:
+    return os.path.join(MEM_DIR, f"sess_{session_id}.json")
+
+
+def load_mem_for_session(session_id: str) -> Dict[str, Any]:
+    path = _mem_path_for_session(session_id)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"scores": [], "last_story": ""}
+
+
+def save_mem_for_session(session_id: str, mem: Dict[str, Any]) -> None:
+    path = _mem_path_for_session(session_id)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mem, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 # ----------------------
 # FastAPI App + UI
 # ----------------------
@@ -421,18 +512,18 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class SignupIn(BaseModel):
-    username: str
+    username: Optional[str] = None
+    email: Optional[str] = None
     password: str
-
 
 class LoginIn(BaseModel):
-    username: str
+    username: Optional[str] = None
+    email: Optional[str] = None
     password: str
-
 
 class ChatIn(BaseModel):
     prompt: str
-
+    session_id: Optional[str] = None
 
 class ChatOut(BaseModel):
     response: str
@@ -476,10 +567,26 @@ def health(request: Request):
 @app.post("/api/auth/signup")
 def signup(payload: SignupIn, request: Request):
     _require_api_key(request)
-    uid = create_user(payload.username, payload.password)
+
+    # Create user with username OR email
+    uid = create_user(
+        username=payload.username,
+        email=payload.email,
+        password=payload.password,
+    )
+
+    # Fetch canonical username from DB
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
+    row = cur.fetchone()
+    conn.close()
+
+    username = row["username"] if row else (payload.username or "")
+
     token = create_session(uid)
 
-    resp = JSONResponse({"ok": True, "username": payload.username.strip()})
+    resp = JSONResponse({"ok": True, "username": username})
     resp.set_cookie(
         SESSION_COOKIE,
         token,
@@ -495,12 +602,28 @@ def signup(payload: SignupIn, request: Request):
 @app.post("/api/auth/login")
 def login(payload: LoginIn, request: Request):
     _require_api_key(request)
-    uid = verify_user(payload.username, payload.password)
+
+    # Allow login via username OR email
+    identifier = (payload.username or payload.email or "").strip()
+    if not identifier:
+        raise HTTPException(status_code=400, detail="username or email is required")
+
+    uid = verify_user(identifier, payload.password)
     if not uid:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    # Fetch canonical username
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
+    row = cur.fetchone()
+    conn.close()
+
+    username = row["username"] if row else identifier
+
     token = create_session(uid)
-    resp = JSONResponse({"ok": True, "username": payload.username.strip()})
+
+    resp = JSONResponse({"ok": True, "username": username})
     resp.set_cookie(
         SESSION_COOKIE,
         token,
@@ -548,28 +671,24 @@ def me(request: Request):
 def chat(payload: ChatIn, request: Request):
     _require_api_key(request)
 
-    user_id = _require_login(request)
-
     prompt = (payload.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     if len(prompt) > MAX_PROMPT_CHARS:
         raise HTTPException(status_code=413, detail=f"prompt too large (max {MAX_PROMPT_CHARS} chars)")
 
-    # Bounded waiting room: if too many people are waiting, reject fast.
+    sid = _safe_session_id(payload.session_id)
+
     if not QUEUE_SEM.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Server is busy. Try again in a moment.")
 
     try:
-        mem = load_mem_for_user(user_id)
+        mem = load_mem_for_session(sid)
 
-        # Serialize actual generation.
         with GEN_LOCK:
             resp_text = ace_once(prompt, mem)
 
-        save_mem_for_user(user_id, mem)
-
+        save_mem_for_session(sid, mem)
         return ChatOut(response=resp_text, device=device, model=MODEL_NAME)
-
     finally:
         QUEUE_SEM.release()

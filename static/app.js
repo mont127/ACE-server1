@@ -1,300 +1,196 @@
+/* ACE Web UI client (vanilla JS) — GUEST ONLY
+   - NO login/signup
+   - Calls /api/chat directly
+   - Uses a stable session_id stored in localStorage
+*/
+
 (() => {
-  'use strict';
+  "use strict";
 
-  // ===== Helpers =====
-  const $ = (id) => document.getElementById(id);
+  const $ = (sel, root = document) => root.querySelector(sel);
 
-  const banner = $('banner');
-  const messagesEl = $('messages');
+  const elHealthPill = $("#healthPill");
+  const elModePill = $("#modePill");
+  const elQueuePill = $("#queuePill");
+  const elBanner = $("#banner");
 
-  const state = {
-    me: null,
-    session_id: null,
-    sending: false,
-  };
+  const chatInput = $("#chatInput");
+  const btnSend = $("#btnSend");
+  const btnClear = $("#btnClear");
+  const chatLog = $("#messages");
 
-  function showBanner(msg, isError = true) {
-    if (!banner) return;
-    banner.textContent = msg || '';
-    banner.style.background = isError ? '#2a1212' : '#132a18';
-    banner.style.borderColor = isError ? '#5a2222' : '#1f4b2b';
-    banner.classList.toggle('show', !!msg);
+  function setText(el, text) {
+    if (!el) return;
+    el.textContent = String(text ?? "");
   }
 
-  function log(...args) {
-    console.log('[ACE UI]', ...args);
+  function showBanner(msg) {
+    if (!elBanner) return;
+    elBanner.textContent = String(msg ?? "");
+    elBanner.classList.add("show");
   }
 
-  async function api(path, { method = 'GET', body = null } = {}) {
-    const opts = {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-    };
-    if (body !== null) opts.body = JSON.stringify(body);
+  function hideBanner() {
+    if (!elBanner) return;
+    elBanner.textContent = "";
+    elBanner.classList.remove("show");
+  }
 
-    const res = await fetch(path, opts);
-    const text = await res.text();
+  function appendMessage(role, text) {
+    if (!chatLog) return;
 
+    const wrap = document.createElement("div");
+    wrap.className = `msg ${role}`;
+
+    // Keep it simple: just text (prevents HTML injection)
+    wrap.textContent = String(text ?? "");
+
+    chatLog.appendChild(wrap);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function ensureSessionId() {
+    const key = "ace_session_id";
+    let sid = localStorage.getItem(key);
+    if (!sid || sid.length < 8) {
+      sid = Array.from(crypto.getRandomValues(new Uint8Array(12)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      localStorage.setItem(key, sid);
+    }
+    return sid;
+  }
+
+  async function apiFetch(path, opts = {}) {
+    const res = await fetch(path, {
+      ...opts,
+      headers: {
+        "Content-Type": "application/json",
+        ...(opts.headers || {}),
+      },
+      // guest mode: no cookies required, but harmless if present
+      credentials: "omit",
+    });
+
+    const ct = res.headers.get("content-type") || "";
     let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+
+    if (ct.includes("application/json")) {
+      try { data = await res.json(); } catch { data = null; }
+    } else {
+      try { data = await res.text(); } catch { data = null; }
+    }
 
     if (!res.ok) {
-      let detail = null;
-      if (data && (data.detail !== undefined)) detail = data.detail;
-      else if (data && (data.message !== undefined)) detail = data.message;
-      else if (data && (data.error !== undefined)) detail = data.error;
-
-      // FastAPI sometimes returns detail as an object
-      if (detail && typeof detail === 'object') {
-        try { detail = JSON.stringify(detail); } catch { detail = String(detail); }
-      }
-      if (!detail) detail = `HTTP ${res.status}`;
-      throw new Error(String(detail));
+      const detail = (data && data.detail) ? data.detail : data;
+      const msg = typeof detail === "string" ? detail : JSON.stringify(detail ?? `HTTP ${res.status}`);
+      const err = new Error(msg);
+      err.status = res.status;
+      err.data = data;
+      throw err;
     }
+
     return data;
   }
 
-  function addMessage(role, text) {
-    if (!messagesEl) return;
-    const div = document.createElement('div');
-    div.className = `msg ${role}`;
-    div.textContent = text;
-    messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-
-  // ===== Modal controls =====
-  function openModal(backdropId) {
-    const el = $(backdropId);
-    if (!el) return;
-    el.classList.add('show');
-    el.setAttribute('aria-hidden', 'false');
-  }
-
-  function closeModal(backdropId) {
-    const el = $(backdropId);
-    if (!el) return;
-    el.classList.remove('show');
-    el.setAttribute('aria-hidden', 'true');
-  }
-
-  function wireModalClose(backdropId, closeBtnId) {
-    const back = $(backdropId);
-    const btn = $(closeBtnId);
-
-    if (btn) {
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        closeModal(backdropId);
-      });
-    }
-
-    if (back) {
-      back.addEventListener('click', (e) => {
-        // click outside modal closes
-        if (e.target === back) closeModal(backdropId);
-      });
-    }
-  }
-
-  // ===== Auth UI =====
-  function setAuthUI(me) {
-    state.me = me;
-
-    const authPill = $('authPill');
-    const btnLogin = $('btnLogin');
-    const btnSignup = $('btnSignup');
-    const btnLogout = $('btnLogout');
-
-    const ident = (me && (me.email || me.username)) ? (me.email || me.username) : '';
-
-    if (ident) {
-      if (authPill) authPill.textContent = `logged in: ${ident}`;
-      if (btnLogin) btnLogin.style.display = 'none';
-      if (btnSignup) btnSignup.style.display = 'none';
-      if (btnLogout) btnLogout.style.display = '';
+  function updateQueuePill(health) {
+    if (!elQueuePill) return;
+    const maxWaiters = health?.queue_max_waiters;
+    if (typeof maxWaiters === "number") {
+      elQueuePill.style.display = "";
+      setText(elQueuePill, `queue max: ${maxWaiters}`);
     } else {
-      if (authPill) authPill.textContent = 'not logged in';
-      if (btnLogin) btnLogin.style.display = '';
-      if (btnSignup) btnSignup.style.display = '';
-      if (btnLogout) btnLogout.style.display = 'none';
+      elQueuePill.style.display = "none";
     }
   }
 
-  async function refreshHealth() {
+  async function loadHealth() {
     try {
-      const h = await api('/api/health');
-      const pill = $('healthPill');
-      if (pill) pill.textContent = `${h.model} | ${h.device}`;
+      const health = await apiFetch("/api/health", { method: "GET" });
+      const model = health?.model || "unknown-model";
+      const device = health?.device || "unknown-device";
+      setText(elHealthPill, `${model} (${device})`);
+      setText(elModePill, "guest");
+      updateQueuePill(health);
     } catch (e) {
-      const pill = $('healthPill');
-      if (pill) pill.textContent = 'health error';
-      log('health failed', e);
+      setText(elHealthPill, "health error");
+      showBanner(String(e.message || e));
     }
   }
 
-  async function refreshMe() {
+  let isSending = false;
+
+  async function sendChat(prompt) {
+    if (isSending) return;
+    const p = String(prompt || "").trim();
+    if (!p) return;
+
+    hideBanner();
+    isSending = true;
+    if (btnSend) btnSend.disabled = true;
+
+    appendMessage("user", p);
+
+    // typing placeholder
+    const typing = document.createElement("div");
+    typing.className = "msg ace";
+    typing.textContent = "…";
+    chatLog.appendChild(typing);
+    chatLog.scrollTop = chatLog.scrollHeight;
+
     try {
-      const me = await api('/api/auth/me');
-      setAuthUI(me && me.user ? me.user : me);
-      showBanner('', false);
+      const session_id = ensureSessionId();
+      const data = await apiFetch("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ prompt: p, session_id }),
+      });
+
+      const resp = data?.response ?? "";
+      typing.remove();
+      appendMessage("ace", resp);
     } catch (e) {
-      setAuthUI(null);
-    }
-  }
-
-  async function signup(email, password) {
-    // Backend expects `username` (and may also accept `email`).
-    // We send both to stay compatible with either schema.
-    const out = await api('/api/auth/signup', {
-      method: 'POST',
-      body: { username: email, email, password },
-    });
-    return out;
-  }
-
-  async function login(email, password) {
-    // Backend expects `username` (and may also accept `email`).
-    const out = await api('/api/auth/login', {
-      method: 'POST',
-      body: { username: email, email, password },
-    });
-    return out;
-  }
-
-  async function logout() {
-    try {
-      await api('/api/auth/logout', { method: 'POST', body: {} });
-    } catch (_) {
-      // ignore
-    }
-  }
-
-  // ===== Chat =====
-  async function sendChat(text) {
-    if (state.sending) return;
-    state.sending = true;
-
-    try {
-      showBanner('', false);
-      addMessage('user', text);
-
-      const payload = { prompt: text };
-      if (state.session_id) payload.session_id = state.session_id;
-
-      const out = await api('/api/chat', { method: 'POST', body: payload });
-      state.session_id = out.session_id;
-      addMessage('ace', out.response);
-    } catch (e) {
-      addMessage('ace', `Error: ${e.message}`);
-      showBanner(`Error: ${e.message}`, true);
-      log('chat failed', e);
+      typing.remove();
+      appendMessage("ace", `ERROR: ${e.message || e}`);
     } finally {
-      state.sending = false;
+      isSending = false;
+      if (btnSend) btnSend.disabled = false;
     }
   }
 
-  // ===== Wire events =====
-  function wireEvents() {
-    const btnLogin = $('btnLogin');
-    const btnSignup = $('btnSignup');
-    const btnLogout = $('btnLogout');
+  function clearChat() {
+    if (!chatLog) return;
+    chatLog.innerHTML = "";
+    hideBanner();
+  }
 
-    if (btnLogin) btnLogin.addEventListener('click', () => openModal('loginBackdrop'));
-    if (btnSignup) btnSignup.addEventListener('click', () => openModal('signupBackdrop'));
-    if (btnLogout) btnLogout.addEventListener('click', async () => {
-      await logout();
-      setAuthUI(null);
-      showBanner('Logged out', false);
-    });
-
-    wireModalClose('loginBackdrop', 'loginClose');
-    wireModalClose('signupBackdrop', 'signupClose');
-
-    const loginForm = $('loginForm');
-    if (loginForm) {
-      loginForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const email = $('loginEmail')?.value?.trim() || '';
-        const password = $('loginPassword')?.value || '';
-        try {
-          await login(email, password);
-          closeModal('loginBackdrop');
-          await refreshMe();
-          showBanner('Logged in', false);
-        } catch (err) {
-          showBanner(`Login failed: ${err?.message || String(err)}`, true);
-        }
+  function wire() {
+    if (btnSend) {
+      btnSend.addEventListener("click", async () => {
+        const p = chatInput?.value ?? "";
+        if (chatInput) chatInput.value = "";
+        await sendChat(p);
       });
     }
 
-    const signupForm = $('signupForm');
-    if (signupForm) {
-      signupForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const email = $('signupEmail')?.value?.trim() || '';
-        const password = $('signupPassword')?.value || '';
-        try {
-          await signup(email, password);
-          // auto-login after signup
-          await login(email, password);
-          closeModal('signupBackdrop');
-          await refreshMe();
-          showBanner('Account created + logged in', false);
-        } catch (err) {
-          showBanner(`Signup failed: ${err?.message || String(err)}`, true);
-        }
-      });
+    if (btnClear) {
+      btnClear.addEventListener("click", () => clearChat());
     }
 
-    const btnSend = $('btnSend');
-    const chatInput = $('chatInput');
-
-    if (btnSend && chatInput) {
-      btnSend.addEventListener('click', async () => {
-        const text = chatInput.value.trim();
-        if (!text) return;
-        chatInput.value = '';
-        await sendChat(text);
-      });
-
-      chatInput.addEventListener('keydown', async (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
+    if (chatInput && chatInput.tagName === "TEXTAREA") {
+      chatInput.addEventListener("keydown", async (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
-          const text = chatInput.value.trim();
-          if (!text) return;
-          chatInput.value = '';
-          await sendChat(text);
+          const p = chatInput.value;
+          chatInput.value = "";
+          await sendChat(p);
         }
       });
     }
   }
 
-  // ===== Boot =====
-  window.addEventListener('error', (e) => {
-    showBanner(`JS error: ${e.message}`, true);
-    log('window error', e);
-  });
-
-  window.addEventListener('unhandledrejection', (e) => {
-    const msg = e?.reason?.message || String(e.reason || 'Promise rejection');
-    showBanner(`Promise error: ${msg}`, true);
-    log('unhandled rejection', e);
-  });
-
-  document.addEventListener('DOMContentLoaded', async () => {
-    log('boot');
-    try {
-      wireEvents();
-      await refreshHealth();
-      await refreshMe();
-      addMessage('ace', 'ACE online. Login or sign up to chat.');
-    } catch (e) {
-
-
-      showBanner(`Startup error: ${e.message}`, true);
-      log('startup failed', e);
-    }
+  document.addEventListener("DOMContentLoaded", async () => {
+    wire();
+    ensureSessionId();
+    await loadHealth();
   });
 })();
