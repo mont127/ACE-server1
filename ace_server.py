@@ -9,25 +9,28 @@ import sqlite3
 import secrets
 import warnings
 import threading
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, List
 
 import torch
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ======================================================
-# ACE v7.3 — SERVER EDITION (FastAPI)
-# + Auth (signup/login) with SQLite
-# + Cookie sessions (HttpOnly)
-# + Bounded queue + generation lock
-# + Per-user filesystem memory under ./mem/
+# ACE SERVER — FULL (FastAPI)
+# - Guest chat w/ session_id
+# - Queue + generation lock
+# - Per-session memory under ./mem/
+# - Optional Auth endpoints kept (but chat does NOT require login)
+# - Modes:
+#     ACW      -> normal (single pass; "Canvas" style)
+#     ACWFULL  -> full ACE (plan -> answer -> critique -> final + summary memory)
 # ======================================================
 
 MODEL_NAME = os.getenv("ACE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-MAX_NEW_TOKENS = int(os.getenv("ACE_MAX_NEW_TOKENS", "7000"))
+MAX_NEW_TOKENS = int(os.getenv("ACE_MAX_NEW_TOKENS", "1400"))   # keep sane; FULL uses multiple passes
 MEM_DIR = os.getenv("ACE_MEM_DIR", "mem")
 DATA_DIR = os.getenv("ACE_DATA_DIR", "data")
 DB_PATH = os.getenv("ACE_DB_PATH", os.path.join(DATA_DIR, "ace.db"))
@@ -35,7 +38,7 @@ DB_PATH = os.getenv("ACE_DB_PATH", os.path.join(DATA_DIR, "ace.db"))
 # Optional API key. If set, require X-API-Key on all API calls.
 API_KEY = os.getenv("ACE_API_KEY", "")
 
-# Auth/session settings
+# Auth/session settings (auth endpoints only)
 SESSION_COOKIE = os.getenv("ACE_SESSION_COOKIE", "ace_session")
 SESSION_TTL_SECONDS = int(os.getenv("ACE_SESSION_TTL_SECONDS", "604800"))  # 7 days
 COOKIE_SECURE = os.getenv("ACE_COOKIE_SECURE", "0") == "1"  # set to 1 behind HTTPS
@@ -43,6 +46,13 @@ COOKIE_SECURE = os.getenv("ACE_COOKIE_SECURE", "0") == "1"  # set to 1 behind HT
 # Safety/abuse limits
 MAX_PROMPT_CHARS = int(os.getenv("ACE_MAX_PROMPT_CHARS", "8000"))
 QUEUE_MAX_WAITERS = int(os.getenv("ACE_QUEUE_MAX_WAITERS", "32"))
+
+# FULL mode settings
+FULL_MAX_TOKENS_PLAN = int(os.getenv("ACE_FULL_MAX_TOKENS_PLAN", "220"))
+FULL_MAX_TOKENS_DRAFT = int(os.getenv("ACE_FULL_MAX_TOKENS_DRAFT", "900"))
+FULL_MAX_TOKENS_CRIT = int(os.getenv("ACE_FULL_MAX_TOKENS_CRIT", "220"))
+FULL_MAX_TOKENS_FINAL = int(os.getenv("ACE_FULL_MAX_TOKENS_FINAL", "900"))
+SUMMARY_EVERY_TURNS = int(os.getenv("ACE_SUMMARY_EVERY_TURNS", "8"))
 
 warnings.filterwarnings(
     "ignore",
@@ -53,14 +63,13 @@ os.makedirs(MEM_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ----------------------
-# SQLite helpers
+# SQLite helpers (auth only)
 # ----------------------
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db() -> None:
     conn = db()
@@ -105,16 +114,11 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
-
-
 def _now() -> int:
     return int(time.time())
 
-
 def _pbkdf2_hash(password: str, salt: bytes) -> bytes:
-    # PBKDF2-HMAC-SHA256
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 210_000)
-
 
 def _consteq(a: bytes, b: bytes) -> bool:
     return hmac.compare_digest(a, b)
@@ -148,16 +152,12 @@ def create_user(username: Optional[str], email: Optional[str], password: str) ->
 
     if not username and not email:
         raise HTTPException(status_code=400, detail="username or email is required")
-
     if email and not _is_valid_email(email):
         raise HTTPException(status_code=400, detail="invalid email")
-
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="password must be at least 8 characters")
-
     if not username:
         username = _unique_username(_username_from_email(email))
-
     if not (3 <= len(username) <= 32) or not re.fullmatch(r"[A-Za-z0-9_\-\.]+", username):
         raise HTTPException(status_code=400, detail="username must be 3-32 chars and only A-Z a-z 0-9 _ - .")
 
@@ -183,7 +183,6 @@ def create_user(username: Optional[str], email: Optional[str], password: str) ->
     finally:
         conn.close()
 
-
 def verify_user(identifier: str, password: str) -> Optional[int]:
     ident = (identifier or "").strip()
     if not ident:
@@ -199,7 +198,6 @@ def verify_user(identifier: str, password: str) -> Optional[int]:
 
     row = cur.fetchone()
     conn.close()
-
     if not row:
         return None
 
@@ -209,7 +207,6 @@ def verify_user(identifier: str, password: str) -> Optional[int]:
     if _consteq(expected, got):
         return int(row["id"])
     return None
-
 
 def create_session(user_id: int) -> str:
     token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
@@ -223,14 +220,12 @@ def create_session(user_id: int) -> str:
     conn.close()
     return token
 
-
 def delete_session(token: str) -> None:
     conn = db()
     cur = conn.cursor()
     cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
     conn.commit()
     conn.close()
-
 
 def get_user_id_from_session(token: str) -> Optional[int]:
     if not token:
@@ -243,7 +238,6 @@ def get_user_id_from_session(token: str) -> Optional[int]:
     if not row:
         return None
     if int(row["expires_at"]) < _now():
-        # expired
         try:
             delete_session(token)
         except Exception:
@@ -263,7 +257,6 @@ def get_device() -> str:
         return "mps"
     return "cpu"
 
-
 device = get_device()
 print("[ACE] Loading model:", MODEL_NAME)
 print("[ACE] Using device:", device)
@@ -274,28 +267,16 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=dtype,
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=dtype)
 model.to(device)
 model.eval()
 model.config.use_cache = True
 
 with torch.inference_mode():
     warm_inputs = tokenizer("Warmup.", return_tensors="pt").to(device)
-    _ = model.generate(
-        **warm_inputs,
-        do_sample=False,
-        max_new_tokens=8,
-        pad_token_id=tokenizer.eos_token_id,
-        use_cache=True,
-    )
+    _ = model.generate(**warm_inputs, do_sample=False, max_new_tokens=8, pad_token_id=tokenizer.eos_token_id, use_cache=True)
 
-# Serialize actual generation (especially on CPU)
 GEN_LOCK = threading.Lock()
-
-# Bounded waiting room (prevents infinite pile-up)
 QUEUE_SEM = threading.Semaphore(QUEUE_MAX_WAITERS)
 
 
@@ -306,20 +287,13 @@ QUEUE_SEM = threading.Semaphore(QUEUE_MAX_WAITERS)
 def _is_qwen_model() -> bool:
     return "qwen" in (MODEL_NAME or "").lower()
 
-
 def _build_qwen_chat_inputs(user_text: str, system_text: Optional[str] = None):
     messages = []
     if system_text:
         messages.append({"role": "system", "content": system_text})
     messages.append({"role": "user", "content": user_text})
 
-    enc = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-    )
-
+    enc = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
     if isinstance(enc, torch.Tensor):
         input_ids = enc
         attention_mask = torch.ones_like(input_ids)
@@ -332,11 +306,7 @@ def _build_qwen_chat_inputs(user_text: str, system_text: Optional[str] = None):
         else:
             attention_mask = torch.ones_like(input_ids)
 
-    return {
-        "input_ids": input_ids.to(device),
-        "attention_mask": attention_mask.to(device),
-    }
-
+    return {"input_ids": input_ids.to(device), "attention_mask": attention_mask.to(device)}
 
 def generate_text(
     prompt: str,
@@ -389,7 +359,36 @@ def generate_text(
 
 
 # ----------------------
-# ACE logic (minimal, keep yours if you want)
+# Modes / Parsing
+# ----------------------
+
+MODE_NORMAL = "normal"
+MODE_FULL = "full"
+
+def parse_mode_and_strip(prompt: str) -> Tuple[str, str]:
+    """
+    ACWFULL wins over ACW.
+    We strip the marker from the prompt.
+    """
+    p = (prompt or "").strip()
+    # tokenize by whitespace to catch suffix markers cleanly
+    parts = p.split()
+    upper_parts = [x.upper() for x in parts]
+
+    mode = MODE_NORMAL
+    if "ACWFULL" in upper_parts or p.upper().endswith("ACWFULL"):
+        mode = MODE_FULL
+        parts = [x for x in parts if x.upper() != "ACWFULL"]
+    elif "ACW" in upper_parts or p.upper().endswith("ACW"):
+        mode = MODE_NORMAL
+        parts = [x for x in parts if x.upper() != "ACW"]
+
+    stripped = " ".join(parts).strip()
+    return mode, stripped
+
+
+# ----------------------
+# ACE logic
 # ----------------------
 
 DEFAULT_SYSTEM_ASSISTANT = (
@@ -398,7 +397,6 @@ DEFAULT_SYSTEM_ASSISTANT = (
     "No jokes, no filler, no meta commentary. "
     "Do not mention policies or safety rules unless the user explicitly asks about them."
 )
-
 
 def is_short_greeting(prompt: str) -> bool:
     p = prompt.strip().lower()
@@ -410,25 +408,26 @@ def is_short_greeting(prompt: str) -> bool:
     greeting_tokens = ["hi", "hello", "hey", "yo", "sup", "ahoj", "čau", "čaute", "cau"]
     return any(tok in p for tok in greeting_tokens)
 
-
 def dynamic_max_tokens(prompt: str) -> int:
     words = len(prompt.strip().split())
     if words == 0:
         return MAX_NEW_TOKENS
     if words <= 3:
-        return min(40, MAX_NEW_TOKENS)
+        return min(60, MAX_NEW_TOKENS)
     if words <= 15:
-        return min(180, MAX_NEW_TOKENS)
+        return min(260, MAX_NEW_TOKENS)
     return MAX_NEW_TOKENS
 
-
-def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
+def ace_normal(prompt: str, mem: Dict[str, Any]) -> str:
+    """
+    Single-pass (what you called the previous "Canvas" normal mode).
+    """
     clean_prompt = (prompt or "").strip()
-
     if is_short_greeting(clean_prompt):
         return "Hello, I'm ACE. What do you want to try?"
 
     max_tokens = dynamic_max_tokens(clean_prompt)
+
     base_prompt = (
         "You are ACE, a helpful assistant.\n"
         "Respond only to the user's last message.\n"
@@ -445,33 +444,115 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
         system_text=DEFAULT_SYSTEM_ASSISTANT,
     )
 
+def _mem_get_summary(mem: Dict[str, Any]) -> str:
+    s = mem.get("summary")
+    return s.strip() if isinstance(s, str) else ""
+
+def _mem_get_history(mem: Dict[str, Any]) -> List[Dict[str, str]]:
+    h = mem.get("history")
+    if isinstance(h, list):
+        out = []
+        for it in h:
+            if isinstance(it, dict) and "role" in it and "content" in it:
+                out.append({"role": str(it["role"]), "content": str(it["content"])})
+        return out
+    return []
+
+def _mem_push_turn(mem: Dict[str, Any], user_text: str, assistant_text: str) -> None:
+    hist = _mem_get_history(mem)
+    hist.append({"role": "user", "content": user_text})
+    hist.append({"role": "assistant", "content": assistant_text})
+    # keep last N messages (raw) to avoid file bloat
+    mem["history"] = hist[-24:]
+    mem["turns"] = int(mem.get("turns", 0)) + 1
+
+def _maybe_update_summary(mem: Dict[str, Any]) -> None:
+    turns = int(mem.get("turns", 0))
+    if turns <= 0 or (turns % SUMMARY_EVERY_TURNS) != 0:
+        return
+
+    hist = _mem_get_history(mem)
+    if not hist:
+        return
+
+    prev_summary = _mem_get_summary(mem)
+    convo_text = "\n".join([f'{m["role"].upper()}: {m["content"]}' for m in hist])
+
+    prompt = (
+        "Update the running memory summary.\n"
+        "Write a compact summary of stable facts and user preferences.\n"
+        "Do not include private data like passwords.\n"
+        "Keep it under 1200 characters.\n\n"
+        f"PREVIOUS SUMMARY:\n{prev_summary}\n\n"
+        f"RECENT DIALOG:\n{convo_text}\n\n"
+        "NEW SUMMARY:"
+    )
+    new_summary = generate_text(prompt, temperature=0.2, top_p=0.9, max_new_tokens=260, system_text=DEFAULT_SYSTEM_ASSISTANT)
+    mem["summary"] = (new_summary or prev_summary).strip()
+
+def ace_full(prompt: str, mem: Dict[str, Any]) -> str:
+    """
+    Multi-pass "FULL ACE":
+      1) Plan
+      2) Draft answer
+      3) Critique / fix
+      4) Final answer (only final returned)
+    Uses lightweight memory summary injection.
+    """
+    clean = (prompt or "").strip()
+    if not clean:
+        return ""
+
+    summary = _mem_get_summary(mem)
+
+    plan_prompt = (
+        "You are ACE FULL.\n"
+        "Make a short plan to answer the user's last message.\n"
+        "Plan should be bullet points.\n"
+        "Do NOT include the final answer.\n\n"
+        f"MEMORY SUMMARY:\n{summary}\n\n"
+        f"USER MESSAGE:\n{clean}\n\n"
+        "PLAN:"
+    )
+    plan = generate_text(plan_prompt, temperature=0.3, top_p=0.9, max_new_tokens=FULL_MAX_TOKENS_PLAN, system_text=DEFAULT_SYSTEM_ASSISTANT)
+
+    draft_prompt = (
+        "You are ACE FULL.\n"
+        "Write the best possible answer to the user.\n"
+        "Be direct, practical, and correct.\n"
+        "No filler.\n\n"
+        f"MEMORY SUMMARY:\n{summary}\n\n"
+        f"PLAN:\n{plan}\n\n"
+        f"USER MESSAGE:\n{clean}\n\n"
+        "DRAFT ANSWER:"
+    )
+    draft = generate_text(draft_prompt, temperature=0.7, top_p=0.92, max_new_tokens=FULL_MAX_TOKENS_DRAFT, system_text=DEFAULT_SYSTEM_ASSISTANT)
+
+    crit_prompt = (
+        "Critique the draft for errors, missing steps, or unclear parts.\n"
+        "Return only the issues as bullets.\n\n"
+        f"USER MESSAGE:\n{clean}\n\n"
+        f"DRAFT:\n{draft}\n\n"
+        "ISSUES:"
+    )
+    issues = generate_text(crit_prompt, temperature=0.25, top_p=0.9, max_new_tokens=FULL_MAX_TOKENS_CRIT, system_text=DEFAULT_SYSTEM_ASSISTANT)
+
+    final_prompt = (
+        "Rewrite the answer fixing the issues.\n"
+        "Return ONLY the final answer.\n"
+        "No headings unless the user asked for them.\n\n"
+        f"USER MESSAGE:\n{clean}\n\n"
+        f"DRAFT:\n{draft}\n\n"
+        f"ISSUES:\n{issues}\n\n"
+        "FINAL ANSWER:"
+    )
+    final = generate_text(final_prompt, temperature=0.6, top_p=0.92, max_new_tokens=FULL_MAX_TOKENS_FINAL, system_text=DEFAULT_SYSTEM_ASSISTANT)
+    return final.strip() or draft.strip()
+
 
 # ----------------------
-# Memory per user (filesystem)
+# Memory per session (filesystem)
 # ----------------------
-
-def _mem_path_for_user(user_id: int) -> str:
-    return os.path.join(MEM_DIR, f"user_{user_id}.json")
-
-
-def load_mem_for_user(user_id: int) -> Dict[str, Any]:
-    path = _mem_path_for_user(user_id)
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"scores": [], "last_story": ""}
-
-
-def save_mem_for_user(user_id: int, mem: Dict[str, Any]) -> None:
-    path = _mem_path_for_user(user_id)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(mem, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
 
 def _safe_session_id(s: Optional[str]) -> str:
     s = (s or "").strip()
@@ -480,21 +561,21 @@ def _safe_session_id(s: Optional[str]) -> str:
     s = re.sub(r"[^a-zA-Z0-9_\-]", "", s)
     return (s[:64] or "guest")
 
-
 def _mem_path_for_session(session_id: str) -> str:
     return os.path.join(MEM_DIR, f"sess_{session_id}.json")
-
 
 def load_mem_for_session(session_id: str) -> Dict[str, Any]:
     path = _mem_path_for_session(session_id)
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d
         except Exception:
             pass
-    return {"scores": [], "last_story": ""}
-
+    # default mem
+    return {"turns": 0, "summary": "", "history": []}
 
 def save_mem_for_session(session_id: str, mem: Dict[str, Any]) -> None:
     path = _mem_path_for_session(session_id)
@@ -503,13 +584,14 @@ def save_mem_for_session(session_id: str, mem: Dict[str, Any]) -> None:
             json.dump(mem, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
+
+
 # ----------------------
 # FastAPI App + UI
 # ----------------------
 
-app = FastAPI(title="ACE Server", version="7.3")
+app = FastAPI(title="ACE Server", version="FULL")
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
 
 class SignupIn(BaseModel):
     username: Optional[str] = None
@@ -529,7 +611,7 @@ class ChatOut(BaseModel):
     response: str
     device: str
     model: str
-
+    mode: str
 
 def _require_api_key(req: Request) -> None:
     if not API_KEY:
@@ -538,54 +620,41 @@ def _require_api_key(req: Request) -> None:
     if got != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-
-def _require_login(req: Request) -> int:
-    token = req.cookies.get(SESSION_COOKIE, "")
-    user_id = get_user_id_from_session(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not logged in")
-    return user_id
-
-
 @app.on_event("startup")
 def _startup():
     init_db()
-
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     with open(os.path.join("static", "index.html"), "r", encoding="utf-8") as f:
         return f.read()
 
-
 @app.get("/api/health")
 def health(request: Request):
     _require_api_key(request)
-    return {"ok": True, "model": MODEL_NAME, "device": device, "queue_max_waiters": QUEUE_MAX_WAITERS}
+    return {
+        "ok": True,
+        "model": MODEL_NAME,
+        "device": device,
+        "queue_max_waiters": QUEUE_MAX_WAITERS,
+        "modes": ["ACW", "ACWFULL"],
+    }
 
+# ---- Auth endpoints kept (optional to use later) ----
 
 @app.post("/api/auth/signup")
 def signup(payload: SignupIn, request: Request):
     _require_api_key(request)
+    uid = create_user(username=payload.username, email=payload.email, password=payload.password)
 
-    # Create user with username OR email
-    uid = create_user(
-        username=payload.username,
-        email=payload.email,
-        password=payload.password,
-    )
-
-    # Fetch canonical username from DB
     conn = db()
     cur = conn.cursor()
     cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
     row = cur.fetchone()
     conn.close()
-
     username = row["username"] if row else (payload.username or "")
 
     token = create_session(uid)
-
     resp = JSONResponse({"ok": True, "username": username})
     resp.set_cookie(
         SESSION_COOKIE,
@@ -598,12 +667,9 @@ def signup(payload: SignupIn, request: Request):
     )
     return resp
 
-
 @app.post("/api/auth/login")
 def login(payload: LoginIn, request: Request):
     _require_api_key(request)
-
-    # Allow login via username OR email
     identifier = (payload.username or payload.email or "").strip()
     if not identifier:
         raise HTTPException(status_code=400, detail="username or email is required")
@@ -612,17 +678,14 @@ def login(payload: LoginIn, request: Request):
     if not uid:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    # Fetch canonical username
     conn = db()
     cur = conn.cursor()
     cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
     row = cur.fetchone()
     conn.close()
-
     username = row["username"] if row else identifier
 
     token = create_session(uid)
-
     resp = JSONResponse({"ok": True, "username": username})
     resp.set_cookie(
         SESSION_COOKIE,
@@ -634,7 +697,6 @@ def login(payload: LoginIn, request: Request):
         path="/",
     )
     return resp
-
 
 @app.post("/api/auth/logout")
 def logout(request: Request):
@@ -649,7 +711,6 @@ def logout(request: Request):
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
 
-
 @app.get("/api/auth/me")
 def me(request: Request):
     _require_api_key(request)
@@ -657,25 +718,28 @@ def me(request: Request):
     uid = get_user_id_from_session(token)
     if not uid:
         return {"logged_in": False}
-
     conn = db()
     cur = conn.cursor()
     cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
     row = cur.fetchone()
     conn.close()
-
     return {"logged_in": True, "user_id": uid, "username": row["username"] if row else ""}
 
+# ---- Guest chat (main) ----
 
 @app.post("/api/chat", response_model=ChatOut)
 def chat(payload: ChatIn, request: Request):
     _require_api_key(request)
 
-    prompt = (payload.prompt or "").strip()
+    raw_prompt = (payload.prompt or "").strip()
+    if not raw_prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if len(raw_prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(status_code=413, detail=f"prompt too large (max {MAX_PROMPT_CHARS} chars)")
+
+    mode, prompt = parse_mode_and_strip(raw_prompt)
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
-    if len(prompt) > MAX_PROMPT_CHARS:
-        raise HTTPException(status_code=413, detail=f"prompt too large (max {MAX_PROMPT_CHARS} chars)")
 
     sid = _safe_session_id(payload.session_id)
 
@@ -686,9 +750,17 @@ def chat(payload: ChatIn, request: Request):
         mem = load_mem_for_session(sid)
 
         with GEN_LOCK:
-            resp_text = ace_once(prompt, mem)
+            if mode == MODE_FULL:
+                resp_text = ace_full(prompt, mem)
+            else:
+                resp_text = ace_normal(prompt, mem)
 
+        # store turn + update summary
+        _mem_push_turn(mem, prompt, resp_text)
+        _maybe_update_summary(mem)
         save_mem_for_session(sid, mem)
-        return ChatOut(response=resp_text, device=device, model=MODEL_NAME)
+
+        return ChatOut(response=resp_text, device=device, model=MODEL_NAME, mode=mode)
+
     finally:
         QUEUE_SEM.release()
