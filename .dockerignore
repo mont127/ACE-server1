@@ -7,3 +7,5 @@ __pycache__
 .git
 .gitignore
 ace_memory_*.json
+mem/
+data/

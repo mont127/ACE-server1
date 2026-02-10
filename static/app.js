@@ -1,7 +1,7 @@
-/* ACE Web UI client (vanilla JS) — GUEST ONLY
-   - NO login/signup
-   - Calls /api/chat directly
-   - Uses a stable session_id stored in localStorage
+/* ACE Web UI client (vanilla JS)
+   - Login/Signup (cookie session)
+   - Loads chat history from /api/chat/history
+   - Calls /api/chat with credentials
 */
 
 (() => {
@@ -10,7 +10,7 @@
   const $ = (sel, root = document) => root.querySelector(sel);
 
   const elHealthPill = $("#healthPill");
-  const elModePill = $("#modePill");
+  const elAuthPill = $("#authPill");
   const elQueuePill = $("#queuePill");
   const elBanner = $("#banner");
 
@@ -18,6 +18,24 @@
   const btnSend = $("#btnSend");
   const btnClear = $("#btnClear");
   const chatLog = $("#messages");
+
+  const btnLogin = $("#btnLogin");
+  const btnSignup = $("#btnSignup");
+  const btnLogout = $("#btnLogout");
+
+  const loginBackdrop = $("#loginBackdrop");
+  const loginClose = $("#loginClose");
+  const loginForm = $("#loginForm");
+  const loginIdent = $("#loginIdent");
+  const loginPassword = $("#loginPassword");
+  const loginError = $("#loginError");
+
+  const signupBackdrop = $("#signupBackdrop");
+  const signupClose = $("#signupClose");
+  const signupForm = $("#signupForm");
+  const signupEmail = $("#signupEmail");
+  const signupPassword = $("#signupPassword");
+  const signupError = $("#signupError");
 
   function setText(el, text) {
     if (!el) return;
@@ -36,17 +54,31 @@
     elBanner.classList.remove("show");
   }
 
+  function showModal(backdrop) {
+    if (!backdrop) return;
+    backdrop.classList.add("show");
+    backdrop.setAttribute("aria-hidden", "false");
+  }
+
+  function hideModal(backdrop) {
+    if (!backdrop) return;
+    backdrop.classList.remove("show");
+    backdrop.setAttribute("aria-hidden", "true");
+  }
+
   function appendMessage(role, text) {
     if (!chatLog) return;
-
     const wrap = document.createElement("div");
     wrap.className = `msg ${role}`;
-
-    // Keep it simple: just text (prevents HTML injection)
     wrap.textContent = String(text ?? "");
-
     chatLog.appendChild(wrap);
     chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function clearChatUI() {
+    if (!chatLog) return;
+    chatLog.innerHTML = "";
+    hideBanner();
   }
 
   function ensureSessionId() {
@@ -68,8 +100,7 @@
         "Content-Type": "application/json",
         ...(opts.headers || {}),
       },
-      // guest mode: no cookies required, but harmless if present
-      credentials: "omit",
+      credentials: "include",
     });
 
     const ct = res.headers.get("content-type") || "";
@@ -110,12 +141,104 @@
       const model = health?.model || "unknown-model";
       const device = health?.device || "unknown-device";
       setText(elHealthPill, `${model} (${device})`);
-      setText(elModePill, "guest");
       updateQueuePill(health);
     } catch (e) {
       setText(elHealthPill, "health error");
       showBanner(String(e.message || e));
     }
+  }
+
+  let me = { logged_in: false, username: "" };
+
+  function renderAuth() {
+    if (me?.logged_in) {
+      setText(elAuthPill, `logged in: ${me.username || "user"}`);
+      if (btnLogin) btnLogin.style.display = "none";
+      if (btnSignup) btnSignup.style.display = "none";
+      if (btnLogout) btnLogout.style.display = "";
+    } else {
+      setText(elAuthPill, "not logged in");
+      if (btnLogin) btnLogin.style.display = "";
+      if (btnSignup) btnSignup.style.display = "";
+      if (btnLogout) btnLogout.style.display = "none";
+    }
+  }
+
+  async function refreshMe() {
+    try {
+      const data = await apiFetch("/api/auth/me", { method: "GET" });
+      me = data || { logged_in: false };
+    } catch {
+      me = { logged_in: false };
+    }
+    renderAuth();
+  }
+
+  async function loadHistory() {
+    if (!me?.logged_in) return;
+    try {
+      const data = await apiFetch("/api/chat/history?limit=200", { method: "GET" });
+      clearChatUI();
+      const msgs = data?.messages || [];
+      for (const m of msgs) {
+        const role = (m.role === "assistant") ? "ace" : "user";
+        appendMessage(role, m.content);
+      }
+    } catch (e) {
+      showBanner(String(e.message || e));
+    }
+  }
+
+  function buildAuthPayload(identOrEmail, password) {
+    const v = String(identOrEmail || "").trim();
+    // backend accepts username OR email
+    return { username: v, email: v, password: String(password || "") };
+  }
+
+  async function doLogin() {
+    setText(loginError, "");
+    try {
+      await apiFetch("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify(buildAuthPayload(loginIdent?.value, loginPassword?.value)),
+      });
+      hideModal(loginBackdrop);
+      await refreshMe();
+      await loadHistory();
+    } catch (e) {
+      setText(loginError, `Login failed: ${e.message || e}`);
+      throw e;
+    }
+  }
+
+  async function doSignup() {
+    setText(signupError, "");
+    try {
+      await apiFetch("/api/auth/signup", {
+        method: "POST",
+        body: JSON.stringify({
+          email: String(signupEmail?.value || "").trim(),
+          password: String(signupPassword?.value || ""),
+        }),
+      });
+      hideModal(signupBackdrop);
+      await refreshMe();
+      await loadHistory();
+    } catch (e) {
+      setText(signupError, `Signup failed: ${e.message || e}`);
+      throw e;
+    }
+  }
+
+  async function doLogout() {
+    try {
+      await apiFetch("/api/auth/logout", { method: "POST" });
+    } catch {
+      // ignore
+    }
+    me = { logged_in: false };
+    renderAuth();
+    clearChatUI();
   }
 
   let isSending = false;
@@ -125,13 +248,18 @@
     const p = String(prompt || "").trim();
     if (!p) return;
 
+    if (!me?.logged_in) {
+      showBanner("Please login to use chat.");
+      showModal(loginBackdrop);
+      return;
+    }
+
     hideBanner();
     isSending = true;
     if (btnSend) btnSend.disabled = true;
 
     appendMessage("user", p);
 
-    // typing placeholder
     const typing = document.createElement("div");
     typing.className = "msg ace";
     typing.textContent = "…";
@@ -150,20 +278,60 @@
       appendMessage("ace", resp);
     } catch (e) {
       typing.remove();
-      appendMessage("ace", `ERROR: ${e.message || e}`);
+      if (e.status === 401) {
+        showBanner("Session expired. Please login again.");
+        showModal(loginBackdrop);
+      } else {
+        appendMessage("ace", `ERROR: ${e.message || e}`);
+      }
     } finally {
       isSending = false;
       if (btnSend) btnSend.disabled = false;
     }
   }
 
-  function clearChat() {
-    if (!chatLog) return;
-    chatLog.innerHTML = "";
-    hideBanner();
+  async function clearServerHistory() {
+    if (!me?.logged_in) {
+      clearChatUI();
+      return;
+    }
+    try {
+      await apiFetch("/api/chat/clear", { method: "POST" });
+    } catch (e) {
+      showBanner(String(e.message || e));
+    }
+    clearChatUI();
   }
 
   function wire() {
+    if (btnLogin) btnLogin.addEventListener("click", () => showModal(loginBackdrop));
+    if (btnSignup) btnSignup.addEventListener("click", () => showModal(signupBackdrop));
+    if (btnLogout) btnLogout.addEventListener("click", () => doLogout());
+
+    if (loginClose) loginClose.addEventListener("click", () => hideModal(loginBackdrop));
+    if (signupClose) signupClose.addEventListener("click", () => hideModal(signupBackdrop));
+
+    if (loginBackdrop) loginBackdrop.addEventListener("click", (e) => {
+      if (e.target === loginBackdrop) hideModal(loginBackdrop);
+    });
+    if (signupBackdrop) signupBackdrop.addEventListener("click", (e) => {
+      if (e.target === signupBackdrop) hideModal(signupBackdrop);
+    });
+
+    if (loginForm) {
+      loginForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        await doLogin();
+      });
+    }
+
+    if (signupForm) {
+      signupForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        await doSignup();
+      });
+    }
+
     if (btnSend) {
       btnSend.addEventListener("click", async () => {
         const p = chatInput?.value ?? "";
@@ -173,7 +341,9 @@
     }
 
     if (btnClear) {
-      btnClear.addEventListener("click", () => clearChat());
+      btnClear.addEventListener("click", async () => {
+        await clearServerHistory();
+      });
     }
 
     if (chatInput && chatInput.tagName === "TEXTAREA") {
@@ -191,6 +361,12 @@
   document.addEventListener("DOMContentLoaded", async () => {
     wire();
     ensureSessionId();
+    hideModal(loginBackdrop);
+    hideModal(signupBackdrop);
     await loadHealth();
+    await refreshMe();
+    if (me?.logged_in) {
+      await loadHistory();
+    }
   });
 })();
