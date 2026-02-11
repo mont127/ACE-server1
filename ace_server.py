@@ -9,6 +9,7 @@ import sqlite3
 import secrets
 import warnings
 import threading
+from collections import deque
 from typing import Dict, Any, Optional, Tuple, List
 
 import torch
@@ -48,9 +49,21 @@ SESSION_COOKIE = os.getenv("ACE_SESSION_COOKIE", "ace_session")
 SESSION_TTL_SECONDS = int(os.getenv("ACE_SESSION_TTL_SECONDS", "604800"))  # 7 days
 COOKIE_SECURE = os.getenv("ACE_COOKIE_SECURE", "0") == "1"  # set to 1 behind HTTPS
 
-# Abuse limits
 MAX_PROMPT_CHARS = int(os.getenv("ACE_MAX_PROMPT_CHARS", "8000"))
 QUEUE_MAX_WAITERS = int(os.getenv("ACE_QUEUE_MAX_WAITERS", "32"))
+
+# Basic in-memory rate limiting (per IP)
+CHAT_RPM = int(os.getenv("ACE_CHAT_RPM", "30"))            # requests per minute per IP
+LOGIN_RPM = int(os.getenv("ACE_LOGIN_RPM", "12"))          # login attempts per minute per IP
+SIGNUP_RPM = int(os.getenv("ACE_SIGNUP_RPM", "6"))         # signup attempts per minute per IP
+FULL_CHAT_RPM = int(os.getenv("ACE_FULL_CHAT_RPM", "6"))   # ACWFULL requests per minute per IP
+
+# Session-id hardening: derive a server-side chat session id from the cookie token.
+# IMPORTANT: set this to a strong random value in production and keep it stable across restarts.
+SESSION_HMAC_SECRET = os.getenv("ACE_SESSION_HMAC_SECRET", "")
+
+# Gate ACWFULL behind an explicit flag (helps prevent compute-abuse)
+ENABLE_FULL_MODE = os.getenv("ACE_ENABLE_FULL_MODE", "0") == "1"
 
 # FULL mode settings
 FULL_MAX_TOKENS_PLAN = int(os.getenv("ACE_FULL_MAX_TOKENS_PLAN", "220"))
@@ -66,6 +79,80 @@ warnings.filterwarnings(
 
 os.makedirs(MEM_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ----------------------
+# Security helpers (IP + rate limiting + session id)
+# ----------------------
+
+_rl_lock = threading.Lock()
+
+
+class _RateLimiter:
+    def __init__(self, rpm: int):
+        self.rpm = max(1, int(rpm or 1))
+        self.window_s = 60
+        self.hits: Dict[str, deque] = {}
+
+    def allow(self, key: str) -> bool:
+        now = _now()
+        with _rl_lock:
+            dq = self.hits.get(key)
+            if dq is None:
+                dq = deque()
+                self.hits[key] = dq
+
+            cutoff = now - self.window_s
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+            if len(dq) >= self.rpm:
+                return False
+
+            dq.append(now)
+            return True
+
+
+def _get_client_ip(req: Request) -> str:
+    # Cloudflare Tunnel / proxy headers
+    for hdr in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
+        v = req.headers.get(hdr)
+        if v:
+            # X-Forwarded-For may be a list
+            return v.split(",")[0].strip()
+
+    if req.client and req.client.host:
+        return str(req.client.host)
+
+    return "unknown"
+
+
+def _rate_limit_or_429(req: Request, limiter: _RateLimiter, scope: str) -> None:
+    ip = _get_client_ip(req)
+    key = f"{scope}:{ip}"
+    if not limiter.allow(key):
+        raise HTTPException(status_code=429, detail="Too many requests. Slow down.")
+
+
+def _server_chat_session_id_from_cookie(req: Request) -> Optional[str]:
+    # Derive a stable, non-sensitive session_id from the cookie token.
+    token = (req.cookies.get(SESSION_COOKIE, "") or "").strip()
+    if not token:
+        return None
+
+    # If the secret is missing, fall back to a hashed token (still avoids storing raw token).
+    secret = SESSION_HMAC_SECRET.strip()
+    if secret:
+        digest = hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+    else:
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    return digest[:24]
+
+
+_chat_rl = _RateLimiter(CHAT_RPM)
+_full_chat_rl = _RateLimiter(FULL_CHAT_RPM)
+_login_rl = _RateLimiter(LOGIN_RPM)
+_signup_rl = _RateLimiter(SIGNUP_RPM)
 
 
 # ----------------------
@@ -781,6 +868,7 @@ def health(request: Request):
 @app.post("/api/auth/signup")
 def signup(payload: SignupIn, request: Request):
     _require_api_key(request)
+    _rate_limit_or_429(request, _signup_rl, "signup")
 
     uid = create_user(username=payload.username, email=payload.email, password=payload.password)
 
@@ -810,6 +898,7 @@ def signup(payload: SignupIn, request: Request):
 @app.post("/api/auth/login")
 def login(payload: LoginIn, request: Request):
     _require_api_key(request)
+    _rate_limit_or_429(request, _login_rl, "login")
 
     identifier = (payload.username or payload.email or "").strip()
     if not identifier:
@@ -899,6 +988,8 @@ def chat_clear(request: Request):
 def chat(payload: ChatIn, request: Request):
     _require_api_key(request)
     uid = _require_login(request)
+    # Rate limit per IP
+    _rate_limit_or_429(request, _chat_rl, "chat")
 
     raw_prompt = (payload.prompt or "").strip()
     if not raw_prompt:
@@ -910,7 +1001,16 @@ def chat(payload: ChatIn, request: Request):
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
 
-    sid = (payload.session_id or "").strip() or None
+    # Gate ACWFULL to reduce compute-abuse (enable with ACE_ENABLE_FULL_MODE=1)
+    if mode == MODE_FULL and not ENABLE_FULL_MODE:
+        raise HTTPException(status_code=403, detail="ACWFULL is disabled")
+
+    # Additional tighter rate limit for ACWFULL
+    if mode == MODE_FULL:
+        _rate_limit_or_429(request, _full_chat_rl, "full")
+
+    # Ignore client-provided session_id to prevent spoofing; derive server-side session id.
+    sid = _server_chat_session_id_from_cookie(request)
 
     if not QUEUE_SEM.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Server is busy. Try again in a moment.")
