@@ -6,3 +6,5 @@ ace_memory_*.json
 .DS_Store
 .env
 .cache/
+# local secrets
+.env
