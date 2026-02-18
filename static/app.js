@@ -37,6 +37,12 @@
   const signupPassword = $("#signupPassword");
   const signupError = $("#signupError");
 
+  const otpBackdrop = $("#otpBackdrop");
+  const otpClose = $("#otpClose");
+  const otpForm = $("#otpForm");
+  const otpCode = $("#otpCode");
+  const otpError = $("#otpError");
+
   function setText(el, text) {
     if (!el) return;
     el.textContent = String(text ?? "");
@@ -198,15 +204,44 @@
   async function doLogin() {
     setText(loginError, "");
     try {
-      await apiFetch("/api/auth/login", {
+      const resp = await apiFetch("/api/auth/login", {
         method: "POST",
         body: JSON.stringify(buildAuthPayload(loginIdent?.value, loginPassword?.value)),
       });
+
       hideModal(loginBackdrop);
+
+      if (resp && resp.otp_required) {
+        setText(otpError, "");
+        if (otpCode) otpCode.value = "";
+        showModal(otpBackdrop);
+        if (otpCode) otpCode.focus();
+        return;
+      }
+
       await refreshMe();
       await loadHistory();
     } catch (e) {
       setText(loginError, `Login failed: ${e.message || e}`);
+      throw e;
+    }
+  }
+
+  async function doOtpVerify() {
+    setText(otpError, "");
+    try {
+      await apiFetch("/api/auth/login/verify", {
+        method: "POST",
+        body: JSON.stringify({ otp: String(otpCode?.value || "").trim() }),
+      });
+
+      hideModal(otpBackdrop);
+      if (otpCode) otpCode.value = "";
+
+      await refreshMe();
+      await loadHistory();
+    } catch (e) {
+      setText(otpError, `Verify failed: ${e.message || e}`);
       throw e;
     }
   }
@@ -310,12 +345,16 @@
 
     if (loginClose) loginClose.addEventListener("click", () => hideModal(loginBackdrop));
     if (signupClose) signupClose.addEventListener("click", () => hideModal(signupBackdrop));
+    if (otpClose) otpClose.addEventListener("click", () => hideModal(otpBackdrop));
 
     if (loginBackdrop) loginBackdrop.addEventListener("click", (e) => {
       if (e.target === loginBackdrop) hideModal(loginBackdrop);
     });
     if (signupBackdrop) signupBackdrop.addEventListener("click", (e) => {
       if (e.target === signupBackdrop) hideModal(signupBackdrop);
+    });
+    if (otpBackdrop) otpBackdrop.addEventListener("click", (e) => {
+      if (e.target === otpBackdrop) hideModal(otpBackdrop);
     });
 
     if (loginForm) {
@@ -329,6 +368,13 @@
       signupForm.addEventListener("submit", async (e) => {
         e.preventDefault();
         await doSignup();
+      });
+    }
+
+    if (otpForm) {
+      otpForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        await doOtpVerify();
       });
     }
 
@@ -363,6 +409,7 @@
     ensureSessionId();
     hideModal(loginBackdrop);
     hideModal(signupBackdrop);
+    hideModal(otpBackdrop);
     await loadHealth();
     await refreshMe();
     if (me?.logged_in) {

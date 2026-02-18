@@ -9,12 +9,18 @@ import sqlite3
 import secrets
 import warnings
 import threading
+import urllib.parse
+import urllib.request
+import urllib.error
+import smtplib
+import ssl
+from email.message import EmailMessage
 from collections import deque
 from typing import Dict, Any, Optional, Tuple, List
 
 import torch
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -44,10 +50,34 @@ DB_PATH = os.getenv("ACE_DB_PATH", os.path.join(DATA_DIR, "ace.db"))
 # Optional API key. If set, require X-API-Key on all API calls.
 API_KEY = os.getenv("ACE_API_KEY", "")
 
+# Public base URL (used for OAuth redirect URIs). Example: https://xxxx.trycloudflare.com
+ACE_PUBLIC_BASE_URL = os.getenv("ACE_PUBLIC_BASE_URL", "").rstrip("/")
+
+# Google OAuth (optional)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+# Optional: separate secret for OAuth state; falls back to ACE_SESSION_HMAC_SECRET
+OAUTH_STATE_SECRET = os.getenv("ACE_OAUTH_STATE_SECRET", "").strip()
+
 # Cookie session settings
 SESSION_COOKIE = os.getenv("ACE_SESSION_COOKIE", "ace_session")
 SESSION_TTL_SECONDS = int(os.getenv("ACE_SESSION_TTL_SECONDS", "604800"))  # 7 days
 COOKIE_SECURE = os.getenv("ACE_COOKIE_SECURE", "0") == "1"  # set to 1 behind HTTPS
+
+# Email OTP (2FA) for login (optional)
+ACE_2FA_ENABLED = os.getenv("ACE_2FA_ENABLED", "0") == "1"
+ACE_2FA_OTP_TTL_SECONDS = int(os.getenv("ACE_2FA_OTP_TTL_SECONDS", "600"))  # 10 min
+ACE_2FA_CODE_LENGTH = int(os.getenv("ACE_2FA_CODE_LENGTH", "6"))
+ACE_2FA_MAX_ATTEMPTS = int(os.getenv("ACE_2FA_MAX_ATTEMPTS", "6"))
+
+# SMTP settings (required if ACE_2FA_ENABLED=1)
+ACE_SMTP_HOST = os.getenv("ACE_SMTP_HOST", "").strip()
+ACE_SMTP_PORT = int(os.getenv("ACE_SMTP_PORT", "587"))
+ACE_SMTP_USER = os.getenv("ACE_SMTP_USER", "").strip()
+ACE_SMTP_PASS = os.getenv("ACE_SMTP_PASS", "").strip()
+ACE_SMTP_FROM = os.getenv("ACE_SMTP_FROM", "").strip() or ACE_SMTP_USER
+ACE_SMTP_TLS = os.getenv("ACE_SMTP_TLS", "1") == "1"
+ACE_SMTP_SSL = os.getenv("ACE_SMTP_SSL", "0") == "1"
 
 MAX_PROMPT_CHARS = int(os.getenv("ACE_MAX_PROMPT_CHARS", "8000"))
 QUEUE_MAX_WAITERS = int(os.getenv("ACE_QUEUE_MAX_WAITERS", "32"))
@@ -200,6 +230,22 @@ def init_db() -> None:
         """
     )
 
+    # Login OTP challenges (email 2FA)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS login_otps (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            code_hash BLOB NOT NULL,
+            expires_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_login_otps_user_time ON login_otps(user_id, created_at)")
+
     # Chat history
     cur.execute(
         """
@@ -225,6 +271,22 @@ def init_db() -> None:
 
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    except Exception:
+        pass
+
+    # Google OAuth columns (nullable for existing/local users)
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN auth_provider TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
     except Exception:
         pass
 
@@ -267,6 +329,143 @@ def _unique_username(base: str) -> str:
         candidate = f"{base}_{secrets.token_hex(3)}"[:32]
     conn.close()
     return f"{base}_{secrets.token_hex(4)}"[:32]
+
+
+# --- OAuth helpers ---
+
+def _json_load_bytes(b: bytes) -> Any:
+    return json.loads(b.decode("utf-8"))
+
+
+def _http_post_form(url: str, data: Dict[str, str], timeout: int = 15) -> Dict[str, Any]:
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _json_load_bytes(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "ignore")
+        except Exception:
+            detail = str(e)
+        raise HTTPException(status_code=401, detail=f"OAuth exchange failed: {detail[:500]}")
+
+
+def _http_get_json(url: str, timeout: int = 15) -> Dict[str, Any]:
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _json_load_bytes(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "ignore")
+        except Exception:
+            detail = str(e)
+        raise HTTPException(status_code=401, detail=f"OAuth verify failed: {detail[:500]}")
+
+
+def _oauth_state_secret() -> str:
+    s = (OAUTH_STATE_SECRET or SESSION_HMAC_SECRET or "").strip()
+    return s
+
+
+def _make_oauth_state() -> str:
+    secret = _oauth_state_secret()
+    if not secret:
+        raise HTTPException(status_code=500, detail="OAuth is not configured (missing ACE_OAUTH_STATE_SECRET or ACE_SESSION_HMAC_SECRET)")
+    nonce = base64.urlsafe_b64encode(secrets.token_bytes(18)).decode("ascii").rstrip("=")
+    sig = hmac.new(secret.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return f"{nonce}.{sig}"
+
+
+def _verify_oauth_state(state: str) -> bool:
+    secret = _oauth_state_secret()
+    if not secret:
+        return False
+    state = (state or "").strip()
+    if "." not in state:
+        return False
+    nonce, sig = state.split(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+    return hmac.compare_digest(sig, expected)
+
+
+def _google_redirect_uri() -> str:
+    if not ACE_PUBLIC_BASE_URL:
+        raise HTTPException(status_code=500, detail="OAuth is not configured (missing ACE_PUBLIC_BASE_URL)")
+    return f"{ACE_PUBLIC_BASE_URL}/api/auth/google/callback"
+
+
+def _get_user_by_google_sub(google_sub: str) -> Optional[int]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE google_sub = ?", (google_sub,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row["id"]) if row else None
+
+
+def _get_user_by_email(email: str) -> Optional[int]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE email = ?", (email.lower(),))
+    row = cur.fetchone()
+    conn.close()
+    return int(row["id"]) if row else None
+
+
+def upsert_google_user(email: str, google_sub: str) -> int:
+    email = (email or "").strip().lower()
+    google_sub = (google_sub or "").strip()
+    if not email or not google_sub:
+        raise HTTPException(status_code=401, detail="Google profile missing required fields")
+
+    # 1) Existing by google_sub
+    existing = _get_user_by_google_sub(google_sub)
+    if existing:
+        # Ensure provider is set
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET auth_provider = COALESCE(auth_provider, 'google'), email = COALESCE(email, ?) WHERE id = ?",
+            (email, existing),
+        )
+        conn.commit()
+        conn.close()
+        return existing
+
+    # 2) Existing by email -> link account
+    by_email = _get_user_by_email(email)
+    if by_email:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET google_sub = ?, auth_provider = COALESCE(auth_provider, 'google') WHERE id = ?",
+            (google_sub, by_email),
+        )
+        conn.commit()
+        conn.close()
+        return by_email
+
+    # 3) Create new user (password fields are required by schema, generate random)
+    username = _unique_username(_username_from_email(email))
+    salt = secrets.token_bytes(16)
+    pw_hash = _pbkdf2_hash(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii"), salt)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (username, email, salt, pw_hash, created_at, google_sub, auth_provider) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (username, email, salt, pw_hash, _now(), google_sub, "google"),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="user already exists")
+    finally:
+        conn.close()
 
 
 def create_user(username: Optional[str], email: Optional[str], password: str) -> int:
@@ -380,6 +579,121 @@ def get_user_id_from_session(token: str) -> Optional[int]:
         return None
 
     return int(row["user_id"])
+
+# ----------------------
+# Email OTP (2FA) helpers
+# ----------------------
+
+LOGIN_TMP_COOKIE = os.getenv("ACE_LOGIN_TMP_COOKIE", "ace_login_tmp")
+
+def _smtp_ready_or_500() -> None:
+    if not ACE_SMTP_HOST or not ACE_SMTP_FROM:
+        raise HTTPException(status_code=500, detail="SMTP not configured (ACE_SMTP_HOST/ACE_SMTP_FROM)")
+    if not ACE_SMTP_USER or not ACE_SMTP_PASS:
+        raise HTTPException(status_code=500, detail="SMTP not configured (ACE_SMTP_USER/ACE_SMTP_PASS)")
+
+def _otp_secret() -> str:
+    s = (SESSION_HMAC_SECRET or "").strip()
+    if not s:
+        # Works but weaker across restarts; strongly recommend setting ACE_SESSION_HMAC_SECRET
+        s = "ace-default-otp-secret"
+    return s
+
+def _hash_otp(code: str) -> bytes:
+    return hmac.new(_otp_secret().encode("utf-8"), code.encode("utf-8"), hashlib.sha256).digest()
+
+def _gen_otp_code() -> str:
+    n = max(4, min(int(ACE_2FA_CODE_LENGTH or 6), 10))
+    return "".join(str(secrets.randbelow(10)) for _ in range(n))
+
+def _send_email_otp(to_email: str, code: str) -> None:
+    _smtp_ready_or_500()
+
+    msg = EmailMessage()
+    msg["From"] = ACE_SMTP_FROM
+    msg["To"] = to_email
+    msg["Subject"] = "Your ACE login code"
+    msg.set_content(
+        "Your ACE login verification code is:\n\n"
+        f"{code}\n\n"
+        f"This code expires in {max(1, ACE_2FA_OTP_TTL_SECONDS // 60)} minutes."
+    )
+
+    if ACE_SMTP_SSL:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(ACE_SMTP_HOST, ACE_SMTP_PORT, context=context, timeout=15) as s:
+            s.login(ACE_SMTP_USER, ACE_SMTP_PASS)
+            s.send_message(msg)
+        return
+
+    with smtplib.SMTP(ACE_SMTP_HOST, ACE_SMTP_PORT, timeout=15) as s:
+        if ACE_SMTP_TLS:
+            s.starttls(context=ssl.create_default_context())
+        s.login(ACE_SMTP_USER, ACE_SMTP_PASS)
+        s.send_message(msg)
+
+def _create_login_otp(user_id: int):
+    token = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode("ascii").rstrip("=")
+    code = _gen_otp_code()
+    code_hash = _hash_otp(code)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM login_otps WHERE expires_at < ?", (_now(),))
+    except Exception:
+        pass
+
+    cur.execute(
+        "INSERT INTO login_otps (token, user_id, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+        (token, user_id, code_hash, _now() + ACE_2FA_OTP_TTL_SECONDS, _now()),
+    )
+    conn.commit()
+    conn.close()
+    return token, code
+
+def _consume_login_otp(token: str, code: str):
+    token = (token or "").strip()
+    code = (code or "").strip()
+    if not token or not code:
+        return None
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, code_hash, expires_at, attempts FROM login_otps WHERE token = ?", (token,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return None
+
+    if int(row["expires_at"]) < _now():
+        cur.execute("DELETE FROM login_otps WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+
+    attempts = int(row["attempts"])
+    if attempts >= int(ACE_2FA_MAX_ATTEMPTS or 6):
+        cur.execute("DELETE FROM login_otps WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+
+    expected = bytes(row["code_hash"])
+    got = _hash_otp(code)
+
+    if not hmac.compare_digest(expected, got):
+        cur.execute("UPDATE login_otps SET attempts = attempts + 1 WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+        return None
+
+    user_id = int(row["user_id"])
+    cur.execute("DELETE FROM login_otps WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    return user_id
 
 
 # ----------------------
@@ -807,6 +1121,9 @@ class LoginIn(BaseModel):
     email: Optional[str] = None
     password: str
 
+class LoginVerifyIn(BaseModel):
+    otp: str
+
 
 class ChatIn(BaseModel):
     prompt: str
@@ -908,6 +1225,36 @@ def login(payload: LoginIn, request: Request):
     if not uid:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    # If 2FA is enabled, send an email OTP and require verification.
+    if ACE_2FA_ENABLED:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT email, username FROM users WHERE id = ?", (uid,))
+        row = cur.fetchone()
+        conn.close()
+
+        to_email = (row["email"] if row else "") or ""
+        username = row["username"] if row else identifier
+
+        if not to_email:
+            raise HTTPException(status_code=400, detail="2FA is enabled but this account has no email set")
+
+        otp_token, otp_code = _create_login_otp(uid)
+        _send_email_otp(to_email, otp_code)
+
+        resp = JSONResponse({"ok": True, "otp_required": True, "username": username})
+        resp.set_cookie(
+            LOGIN_TMP_COOKIE,
+            otp_token,
+            httponly=True,
+            secure=COOKIE_SECURE,
+            samesite="Lax",
+            max_age=ACE_2FA_OTP_TTL_SECONDS,
+            path="/",
+        )
+        return resp
+
+    # Normal login (no 2FA)
     conn = db()
     cur = conn.cursor()
     cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
@@ -930,6 +1277,43 @@ def login(payload: LoginIn, request: Request):
     return resp
 
 
+# Email OTP verification endpoint
+@app.post("/api/auth/login/verify")
+def login_verify(payload: LoginVerifyIn, request: Request):
+    _require_api_key(request)
+    _rate_limit_or_429(request, _login_rl, "login_verify")
+
+    if not ACE_2FA_ENABLED:
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+
+    otp_token = (request.cookies.get(LOGIN_TMP_COOKIE, "") or "").strip()
+    uid = _consume_login_otp(otp_token, payload.otp)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid or expired verification code")
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
+    row = cur.fetchone()
+    conn.close()
+
+    username = row["username"] if row else "user"
+
+    token = create_session(uid)
+    resp = JSONResponse({"ok": True, "username": username})
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="Lax",
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
+    )
+    resp.delete_cookie(LOGIN_TMP_COOKIE, path="/")
+    return resp
+
+
 @app.post("/api/auth/logout")
 def logout(request: Request):
     _require_api_key(request)
@@ -943,6 +1327,110 @@ def logout(request: Request):
 
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE, path="/")
+    resp.delete_cookie(LOGIN_TMP_COOKIE, path="/")
+    return resp
+
+
+# --- Google OAuth endpoints ---
+
+@app.get("/api/auth/google/start")
+def google_start(request: Request):
+    _require_api_key(request)
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured (missing GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET)")
+
+    state = _make_oauth_state()
+    redirect_uri = _google_redirect_uri()
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "online",
+        "prompt": "select_account",
+    }
+
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    # Store state in a short-lived, HttpOnly cookie
+    resp = RedirectResponse(url=url, status_code=302)
+    resp.set_cookie(
+        "ace_oauth_state",
+        state,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="Lax",
+        max_age=600,
+        path="/",
+    )
+    return resp
+
+
+@app.get("/api/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = ""):
+    _require_api_key(request)
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
+
+    cookie_state = (request.cookies.get("ace_oauth_state", "") or "").strip()
+    if not state or not cookie_state or state != cookie_state or not _verify_oauth_state(state):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    redirect_uri = _google_redirect_uri()
+
+    token_resp = _http_post_form(
+        "https://oauth2.googleapis.com/token",
+        {
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        },
+    )
+
+    id_token = (token_resp.get("id_token") or "").strip()
+    if not id_token:
+        raise HTTPException(status_code=401, detail="Missing id_token")
+
+    # Verify token via Google's tokeninfo endpoint (simple + no extra deps)
+    info = _http_get_json("https://oauth2.googleapis.com/tokeninfo?" + urllib.parse.urlencode({"id_token": id_token}))
+
+    # Basic checks
+    aud = str(info.get("aud", ""))
+    iss = str(info.get("iss", ""))
+    email = str(info.get("email", "")).strip().lower()
+    google_sub = str(info.get("sub", "")).strip()
+    email_verified = str(info.get("email_verified", "")).lower() in ("true", "1", "yes")
+
+    if aud != GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=401, detail="Invalid token audience")
+    if iss not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+    if not email or not google_sub:
+        raise HTTPException(status_code=401, detail="Invalid Google profile")
+    if not email_verified:
+        raise HTTPException(status_code=401, detail="Email not verified")
+
+    uid = upsert_google_user(email=email, google_sub=google_sub)
+
+    # Create ACE session cookie
+    token = create_session(uid)
+    resp = RedirectResponse(url="/", status_code=302)
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="Lax",
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
+    )
+    # Clear state cookie
+    resp.delete_cookie("ace_oauth_state", path="/")
     return resp
 
 
@@ -957,11 +1445,17 @@ def me(request: Request):
 
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT username FROM users WHERE id = ?", (uid,))
+    cur.execute("SELECT username, email, auth_provider FROM users WHERE id = ?", (uid,))
     row = cur.fetchone()
     conn.close()
 
-    return {"logged_in": True, "user_id": uid, "username": row["username"] if row else ""}
+    return {
+        "logged_in": True,
+        "user_id": uid,
+        "username": row["username"] if row else "",
+        "email": row["email"] if row and row["email"] is not None else "",
+        "auth_provider": row["auth_provider"] if row and row["auth_provider"] is not None else "local",
+    }
 
 
 # ---- History endpoints ----
