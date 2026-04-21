@@ -3,6 +3,8 @@
   <img src="6E6AA87C-1366-42CE-A588-3E72D9187903.png" width="384" alt="ACE  icon" />
 </p>
 ---
+
+
 # ACE Server - STILL IN BETA TESTING
 ### Your own AI website, portable and easy
 Run your own AI web app locally or on a server - no subscriptions, no locked platform, just your own stack.
