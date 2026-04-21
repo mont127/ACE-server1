@@ -12,7 +12,7 @@ ACE is a lightweight AI web app you can run on your own machine or server. It gi
 ### Step 1: Download ACE
 Clone the repo or download the source from GitHub.
 ```bash
-git clone https://github.com/mont127/ACE-server1.git
+git clone https://github.com/mont127/ACE-server1
 cd ACE-server1
 
 ```
