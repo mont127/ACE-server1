@@ -4,7 +4,7 @@
 Run your own AI web app locally or on a server — no subscriptions, no locked platform, just your own stack.
 ### A self-hosted AI app with ACE architecture
 ACE is a lightweight AI web app you can run on your own machine or server. It gives you a browser-based chat interface, account system, chat history, optional public tunnel support, and ACE modes like ACW and ACWFULL.
-Need help? Join the Discord server!
+
 
 
 
