@@ -2,8 +2,6 @@
 <p align="center">
   <img src="6E6AA87C-1366-42CE-A588-3E72D9187903.png" width="384" alt="ACE  icon" />
 </p>
----
-
 
 # ACE Server - STILL IN BETA TESTING
 ### Your own AI website, portable and easy
